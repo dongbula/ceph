@@ -22,6 +22,9 @@ void RGWAccessControlList::_add_grant(ACLGrant *grant)
   ACLPermission& perm = grant->get_permission();
   ACLGranteeType& type = grant->get_type();
   switch (type.get_type()) {
+  case ACL_TYPE_REFERER:
+    referer_list.emplace_back(grant->get_referer(), perm.get_permissions());
+    break;
   case ACL_TYPE_GROUP:
     acl_group_map[grant->get_group()] |= perm.get_permissions();
     break;
@@ -66,15 +69,39 @@ int RGWAccessControlList::get_group_perm(ACLGroupTypeEnum group, int perm_mask) 
   return 0;
 }
 
-int RGWAccessControlPolicy::get_perm(rgw_user& id, int perm_mask) {
+int RGWAccessControlList::get_referer_perm(const std::string http_referer,
+                                           const int perm_mask)
+{
+  ldout(cct, 5) << "Searching permissions for referer=" << http_referer
+                << " mask=" << perm_mask << dendl;
+
+  /* FIXME: C++11 doesn't have std::rbegin nor std::rend. We would like to
+   * switch when C++14 becomes available. */
+  const auto iter = std::find_if(referer_list.crbegin(), referer_list.crend(),
+    [http_referer](const ACLReferer& r) -> bool {
+      return r.is_match(http_referer);
+    }
+  );
+
+  if (referer_list.crend() == iter) {
+    ldout(cct, 5) << "Permissions for referer not found" << dendl;
+    return 0;
+  } else {
+    ldout(cct, 5) << "Found referer permission=" << iter->perm << dendl;
+    return iter->perm & perm_mask;
+  }
+}
+
+int RGWAccessControlPolicy::get_perm(rgw_user& id, int perm_mask, const char * const http_referer) {
   int perm = acl.get_perm(id, perm_mask);
 
   if (id.compare(owner.get_id()) == 0) {
     perm |= perm_mask & (RGW_PERM_READ_ACP | RGW_PERM_WRITE_ACP);
   }
 
-  if (perm == perm_mask)
+  if (perm == perm_mask) {
     return perm;
+  }
 
   /* should we continue looking up? */
   if ((perm & perm_mask) != perm_mask) {
@@ -86,16 +113,21 @@ int RGWAccessControlPolicy::get_perm(rgw_user& id, int perm_mask) {
     }
   }
 
+  /* Should we continue looking up even deeper? */
+  if (nullptr != http_referer && (perm & perm_mask) != perm_mask) {
+    perm |= acl.get_referer_perm(http_referer, perm_mask);
+  }
+
   ldout(cct, 5) << "Getting permissions id=" << id << " owner=" << owner.get_id() << " perm=" << perm << dendl;
 
   return perm;
 }
 
-bool RGWAccessControlPolicy::verify_permission(rgw_user& uid, int user_perm_mask, int perm)
+bool RGWAccessControlPolicy::verify_permission(rgw_user& uid, int user_perm_mask, int perm, const char * const http_referer)
 {
   int test_perm = perm | RGW_PERM_READ_OBJS | RGW_PERM_WRITE_OBJS;
 
-  int policy_perm = get_perm(uid, test_perm);
+  int policy_perm = get_perm(uid, test_perm, http_referer);
 
   /* the swift WRITE_OBJS perm is equivalent to the WRITE obj, just
      convert those bits. Note that these bits will only be set on

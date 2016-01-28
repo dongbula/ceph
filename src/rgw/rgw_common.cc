@@ -895,7 +895,8 @@ bool verify_bucket_permission(struct req_state * const s,
   if (!verify_requester_payer_permission(s))
     return false;
 
-  return bucket_acl->verify_permission(s->user->user_id, perm, perm);
+  return bucket_acl->verify_permission(s->user->user_id, perm, perm,
+                                       s->info.env->get("HTTP_REFERER"));
 }
 
 bool verify_bucket_permission(struct req_state * const s, const int perm)
@@ -949,8 +950,9 @@ bool verify_object_permission(struct req_state * const s,
     return false;
   /* we already verified the user mask above, so we pass swift_perm as the mask here,
      otherwise the mask might not cover the swift permissions bits */
+
   return bucket_acl->verify_permission(s->user->user_id, swift_perm,
-				      swift_perm);
+              swift_perm, s->info.env->get("HTTP_REFERER"));
 }
 
 bool verify_object_permission(struct req_state *s, int perm)
