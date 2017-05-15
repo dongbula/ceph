@@ -481,6 +481,7 @@ public:
 
 class RGWSetBucketWebsite : public RGWOp {
 protected:
+  bufferlist in_data;
   RGWBucketWebsiteConf website_conf;
 public:
   RGWSetBucketWebsite() {}
