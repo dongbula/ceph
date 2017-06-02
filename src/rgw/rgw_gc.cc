@@ -147,7 +147,7 @@ int RGWGC::process(int index, int max_secs)
 
   int ret = l.lock_exclusive(&store->gc_pool_ctx, obj_names[index]);
   if (ret == -EBUSY) { /* already locked by another gc processor */
-    dout(0) << "RGWGC::process() failed to acquire lock on " << obj_names[index] << dendl;
+    dout(10) << "RGWGC::process() failed to acquire lock on " << obj_names[index] << dendl;
     return 0;
   }
   if (ret < 0)
@@ -199,7 +199,7 @@ int RGWGC::process(int index, int max_secs)
         key_obj.set_obj(obj.key.name);
         key_obj.set_instance(obj.key.instance);
 
-	dout(0) << "gc::process: removing " << obj.pool << ":" << key_obj.get_object() << dendl;
+	dout(5) << "gc::process: removing " << obj.pool << ":" << key_obj.get_object() << dendl;
 	ObjectWriteOperation op;
 	cls_refcount_put(op, info.tag, true);
         ret = ctx->operate(key_obj.get_object(), &op);
