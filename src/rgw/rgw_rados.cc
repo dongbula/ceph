@@ -1,3 +1,4 @@
+
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
@@ -911,11 +912,6 @@ int RGWPeriod::get_zonegroup(RGWZoneGroup& zonegroup, const string& zonegroup_id
   }
 
   return -ENOENT;
-}
-
-bool RGWPeriod::is_single_zonegroup(CephContext *cct, RGWRados *store)
-{
-  return (period_map.zonegroups.size() == 1);
 }
 
 const string& RGWPeriod::get_latest_epoch_oid()
@@ -7415,7 +7411,7 @@ bool RGWRados::is_syncing_bucket_meta(rgw_bucket& bucket)
   }
 
   /* single zonegroup and a single zone */
-  if (current_period.is_single_zonegroup(cct, this) && get_zonegroup().zones.size() == 1) {
+  if (current_period.is_single_zonegroup() && get_zonegroup().zones.size() == 1) {
     return false;
   }
 
