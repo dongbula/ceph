@@ -832,10 +832,11 @@ public:
         set_status(string("acquiring lock (") + sync_env->status_oid() + ")");
 	uint32_t lock_duration = cct->_conf->rgw_sync_lease_period;
         string lock_name = "sync_lock";
-	lease_cr = new RGWContinuousLeaseCR(sync_env->async_rados, sync_env->store, sync_env->store->get_zone_params().log_pool, sync_env->status_oid(),
-                                            lock_name, lock_duration, this);
-        lease_cr->get();
-        lease_stack = spawn(lease_cr, false);
+        lease_cr.reset(new RGWContinuousLeaseCR(sync_env->async_rados,
+                                                sync_env->store,
+                                                rgw_raw_obj(sync_env->store->get_zone_params().log_pool, sync_env->status_oid()),
+                                                lock_name, lock_duration, this));
+        lease_stack.reset(spawn(lease_cr.get(), false));
       }
       while (!lease_cr->is_locked()) {
         if (lease_cr->is_done()) {
