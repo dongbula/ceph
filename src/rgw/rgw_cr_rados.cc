@@ -321,6 +321,49 @@ int RGWRadosRemoveOmapKeysCR::send_request() {
   return ioctx.aio_operate(oid, cn->completion(), &op);
 }
 
+int RGWRadosRemoveOmapKeysCR::request_complete()
+{
+  int r = cn->completion()->get_return_value();
+
+  set_status() << "request complete; ret=" << r;
+
+  return r;
+}
+
+RGWRadosRemoveCR::RGWRadosRemoveCR(RGWRados *store, const rgw_raw_obj& obj)
+  : RGWSimpleCoroutine(store->ctx()), store(store), obj(obj)
+{
+  set_description() << "remove dest=" << obj;
+}
+
+int RGWRadosRemoveCR::send_request()
+{
+  auto rados = store->get_rados_handle();
+  int r = rados->ioctx_create(obj.pool.name.c_str(), ioctx);
+  if (r < 0) {
+    lderr(cct) << "ERROR: failed to open pool (" << obj.pool.name << ") ret=" << r << dendl;
+    return r;
+  }
+  ioctx.locator_set_key(obj.loc);
+
+  set_status() << "send request";
+
+  librados::ObjectWriteOperation op;
+  op.remove();
+
+  cn = stack->create_completion_notifier();
+  return ioctx.aio_operate(obj.oid, cn->completion(), &op);
+}
+
+int RGWRadosRemoveCR::request_complete()
+{
+  int r = cn->completion()->get_return_value();
+
+  set_status() << "request complete; ret=" << r;
+
+  return r;
+}
+
 RGWSimpleRadosLockCR::RGWSimpleRadosLockCR(RGWAsyncRadosProcessor *_async_rados, RGWRados *_store,
                       const rgw_bucket& _pool, const string& _oid, const string& _lock_name,
                       const string& _cookie,
