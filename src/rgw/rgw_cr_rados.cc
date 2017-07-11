@@ -221,13 +221,6 @@ RGWRadosSetOmapKeysCR::RGWRadosSetOmapKeysCR(RGWRados *_store,
   s << "]";
 }
 
-RGWRadosSetOmapKeysCR::~RGWRadosSetOmapKeysCR()
-{
-  if (cn) {
-    cn->put();
-  }
-}
-
 int RGWRadosSetOmapKeysCR::send_request()
 {
   librados::IoCtx ioctx;
@@ -244,7 +237,6 @@ int RGWRadosSetOmapKeysCR::send_request()
   op.omap_set(entries);
 
   cn = stack->create_completion_notifier();
-  cn->get();
   return ioctx.aio_operate(oid, cn->completion(), &op);
 }
 
@@ -267,10 +259,6 @@ RGWRadosGetOmapKeysCR::RGWRadosGetOmapKeysCR(RGWRados *_store,
                                                 pool(_pool), oid(_oid), cn(NULL)
 {
   set_description() << "set omap keys dest=" << pool.name << "/" << oid << " marker=" << marker;
-}
-
-RGWRadosGetOmapKeysCR::~RGWRadosGetOmapKeysCR()
-{
 }
 
 int RGWRadosGetOmapKeysCR::send_request() {
@@ -300,10 +288,6 @@ RGWRadosRemoveOmapKeysCR::RGWRadosRemoveOmapKeysCR(RGWRados *_store,
   set_description() << "remove omap keys dest=" << pool.name << "/" << oid << " keys=" << keys;
 }
 
-RGWRadosRemoveOmapKeysCR::~RGWRadosRemoveOmapKeysCR()
-{
-}
-
 int RGWRadosRemoveOmapKeysCR::send_request() {
   librados::Rados *rados = store->get_rados_handle();
   int r = rados->ioctx_create(pool.name.c_str(), ioctx); /* system object only! */
@@ -322,40 +306,6 @@ int RGWRadosRemoveOmapKeysCR::send_request() {
 }
 
 int RGWRadosRemoveOmapKeysCR::request_complete()
-{
-  int r = cn->completion()->get_return_value();
-
-  set_status() << "request complete; ret=" << r;
-
-  return r;
-}
-
-RGWRadosRemoveCR::RGWRadosRemoveCR(RGWRados *store, const rgw_raw_obj& obj)
-  : RGWSimpleCoroutine(store->ctx()), store(store), obj(obj)
-{
-  set_description() << "remove dest=" << obj;
-}
-
-int RGWRadosRemoveCR::send_request()
-{
-  auto rados = store->get_rados_handle();
-  int r = rados->ioctx_create(obj.pool.name.c_str(), ioctx);
-  if (r < 0) {
-    lderr(cct) << "ERROR: failed to open pool (" << obj.pool.name << ") ret=" << r << dendl;
-    return r;
-  }
-  ioctx.locator_set_key(obj.loc);
-
-  set_status() << "send request";
-
-  librados::ObjectWriteOperation op;
-  op.remove();
-
-  cn = stack->create_completion_notifier();
-  return ioctx.aio_operate(obj.oid, cn->completion(), &op);
-}
-
-int RGWRadosRemoveCR::request_complete()
 {
   int r = cn->completion()->get_return_value();
 
@@ -669,19 +619,11 @@ RGWRadosTimelogAddCR::RGWRadosTimelogAddCR(RGWRados *_store, const string& _oid,
   entries.push_back(entry);
 }
 
-RGWRadosTimelogAddCR::~RGWRadosTimelogAddCR()
-{
-  if (cn) {
-    cn->put();
-  }
-}
-
 int RGWRadosTimelogAddCR::send_request()
 {
   set_status() << "sending request";
 
   cn = stack->create_completion_notifier();
-  cn->get();
   return store->time_log_add(oid, entries, cn->completion(), true);
 }
 

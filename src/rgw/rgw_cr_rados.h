@@ -395,14 +395,12 @@ class RGWRadosSetOmapKeysCR : public RGWSimpleCoroutine {
   rgw_bucket pool;
   string oid;
 
-  RGWAioCompletionNotifier *cn;
+  boost::intrusive_ptr<RGWAioCompletionNotifier> cn;
 
 public:
   RGWRadosSetOmapKeysCR(RGWRados *_store,
 		      rgw_bucket& _pool, const string& _oid,
 		      map<string, bufferlist>& _entries);
-
-  ~RGWRadosSetOmapKeysCR();
 
   int send_request();
   int request_complete();
@@ -421,15 +419,13 @@ class RGWRadosGetOmapKeysCR : public RGWSimpleCoroutine {
   rgw_bucket pool;
   string oid;
 
-  RGWAioCompletionNotifier *cn;
+  boost::intrusive_ptr<RGWAioCompletionNotifier> cn;
 
 public:
   RGWRadosGetOmapKeysCR(RGWRados *_store,
 		      const rgw_bucket& _pool, const string& _oid,
 		      const string& _marker,
 		      map<string, bufferlist> *_entries, int _max_entries);
-
-  ~RGWRadosGetOmapKeysCR();
 
   int send_request();
 
@@ -456,10 +452,7 @@ public:
 		      const rgw_bucket& _pool, const string& _oid,
 		      const set<string>& _keys);
 
-  ~RGWRadosRemoveOmapKeysCR();
-
   int send_request();
-
   int request_complete() override;
 };
 
@@ -974,12 +967,11 @@ class RGWRadosTimelogAddCR : public RGWSimpleCoroutine {
 
   string oid;
 
-  RGWAioCompletionNotifier *cn;
+  boost::intrusive_ptr<RGWAioCompletionNotifier> cn;
 
 public:
   RGWRadosTimelogAddCR(RGWRados *_store, const string& _oid,
 		        const cls_log_entry& entry);
-  ~RGWRadosTimelogAddCR();
 
   int send_request();
   int request_complete();
