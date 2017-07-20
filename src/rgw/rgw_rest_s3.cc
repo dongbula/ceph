@@ -3751,6 +3751,7 @@ int RGW_Auth_S3::authorize_v4(RGWRados *store, struct req_state *s)
     istringstream cqs(s->aws4_auth->canonical_qs);
     string keyval;
 
+    boost::replace_all(s->aws4_auth->canonical_qs, "+", "%20");
     while (getline(cqs, keyval, '&')) {
       string key, val;
       istringstream kv(keyval);
