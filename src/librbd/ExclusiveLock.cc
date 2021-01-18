@@ -34,8 +34,8 @@ ExclusiveLock<I>::ExclusiveLock(I &image_ctx)
   : RefCountedObject(image_ctx.cct),
     ML<I>(image_ctx.md_ctx, *image_ctx.asio_engine, image_ctx.header_oid,
           image_ctx.image_watcher, managed_lock::EXCLUSIVE,
-          image_ctx.config.template get_val<bool>("rbd_blacklist_on_break_lock"),
-          image_ctx.config.template get_val<uint64_t>("rbd_blacklist_expire_seconds")),
+          image_ctx.config.template get_val<bool>("rbd_blocklist_on_break_lock"),
+          image_ctx.config.template get_val<uint64_t>("rbd_blocklist_expire_seconds")),
     m_image_ctx(image_ctx) {
   std::lock_guard locker{ML<I>::m_lock};
   ML<I>::set_state_uninitialized();
@@ -75,9 +75,10 @@ bool ExclusiveLock<I>::accept_ops(const ceph::mutex &lock) const {
 }
 
 template <typename I>
-void ExclusiveLock<I>::set_require_lock(io::Direction direction,
+void ExclusiveLock<I>::set_require_lock(bool init_shutdown,
+                                        io::Direction direction,
                                         Context* on_finish) {
-  m_image_dispatch->set_require_lock(direction, on_finish);
+  m_image_dispatch->set_require_lock(init_shutdown, direction, on_finish);
 }
 
 template <typename I>
@@ -112,8 +113,8 @@ void ExclusiveLock<I>::unblock_requests() {
 
 template <typename I>
 int ExclusiveLock<I>::get_unlocked_op_error() const {
-  if (m_image_ctx.image_watcher->is_blacklisted()) {
-    return -EBLACKLISTED;
+  if (m_image_ctx.image_watcher->is_blocklisted()) {
+    return -EBLOCKLISTED;
   }
   return -EROFS;
 }
@@ -124,23 +125,40 @@ void ExclusiveLock<I>::init(uint64_t features, Context *on_init) {
 
   on_init = create_context_callback<Context>(on_init, this);
 
-  ldout(m_image_ctx.cct, 10) << dendl;
+  ldout(m_image_ctx.cct, 10) << ": features=" << features << dendl;
 
   {
     std::lock_guard locker{ML<I>::m_lock};
     ML<I>::set_state_initializing();
   }
 
-  auto ctx = new LambdaContext([this, features, on_init](int r) {
-      handle_init_complete(r, features, on_init);
+  m_image_dispatch = exclusive_lock::ImageDispatch<I>::create(&m_image_ctx);
+  m_image_ctx.io_image_dispatcher->register_dispatch(m_image_dispatch);
+
+  on_init = new LambdaContext([this, on_init](int r) {
+      {
+        std::lock_guard locker{ML<I>::m_lock};
+        ML<I>::set_state_unlocked();
+      }
+
+      on_init->complete(r);
     });
-  m_image_ctx.io_image_dispatcher->block_writes(ctx);
+
+  bool pwl_enabled = cache::util::is_pwl_enabled(m_image_ctx);
+  if (m_image_ctx.clone_copy_on_read ||
+      (features & RBD_FEATURE_JOURNALING) != 0 ||
+      pwl_enabled) {
+    m_image_dispatch->set_require_lock(true, io::DIRECTION_BOTH, on_init);
+  } else {
+    m_image_dispatch->set_require_lock(true, io::DIRECTION_WRITE, on_init);
+  }
 }
 
 template <typename I>
 void ExclusiveLock<I>::shut_down(Context *on_shut_down) {
   ldout(m_image_ctx.cct, 10) << dendl;
 
+  auto ref = ceph::ref_t<ExclusiveLock<I>>(this);
   on_shut_down = create_context_callback<Context>(on_shut_down, this);
 
   ML<I>::shut_down(on_shut_down);
@@ -177,41 +195,6 @@ Context *ExclusiveLock<I>::start_op(int* ret_val) {
   return new LambdaContext([this](int r) {
       m_async_op_tracker.finish_op();
     });
-}
-
-template <typename I>
-void ExclusiveLock<I>::handle_init_complete(int r, uint64_t features,
-                                            Context* on_finish) {
-  if (r < 0) {
-    m_image_ctx.io_image_dispatcher->unblock_writes();
-    on_finish->complete(r);
-    return;
-  }
-
-  ldout(m_image_ctx.cct, 10) << ": features=" << features << dendl;
-
-  m_image_dispatch = exclusive_lock::ImageDispatch<I>::create(&m_image_ctx);
-  m_image_ctx.io_image_dispatcher->register_dispatch(m_image_dispatch);
-
-  on_finish = new LambdaContext([this, on_finish](int r) {
-      m_image_ctx.io_image_dispatcher->unblock_writes();
-
-      {
-        std::lock_guard locker{ML<I>::m_lock};
-        ML<I>::set_state_unlocked();
-      }
-
-      on_finish->complete(r);
-    });
-
-  bool rwl_enabled = cache::util::is_rwl_enabled(m_image_ctx);
-  if (m_image_ctx.clone_copy_on_read ||
-      (features & RBD_FEATURE_JOURNALING) != 0 ||
-      rwl_enabled) {
-    m_image_dispatch->set_require_lock(io::DIRECTION_BOTH, on_finish);
-  } else {
-    m_image_dispatch->set_require_lock(io::DIRECTION_WRITE, on_finish);
-  }
 }
 
 template <typename I>

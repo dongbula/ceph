@@ -5,7 +5,6 @@
 #include "common/AsyncOpTracker.h"
 #include "common/dout.h"
 #include "common/errno.h"
-#include "librbd/cache/rwl/ShutdownRequest.h"
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageState.h"
 #include "librbd/ImageWatcher.h"
@@ -13,8 +12,12 @@
 #include "librbd/ObjectMap.h"
 #include "librbd/Utils.h"
 #include "librbd/exclusive_lock/ImageDispatch.h"
+#include "librbd/io/AioCompletion.h"
+#include "librbd/io/ImageDispatchSpec.h"
 #include "librbd/io/ImageDispatcherInterface.h"
 #include "librbd/io/ObjectDispatcherInterface.h"
+#include "librbd/io/Types.h"
+#include "librbd/PluginRegistry.h"
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -55,30 +58,6 @@ PreReleaseRequest<I>::~PreReleaseRequest() {
 
 template <typename I>
 void PreReleaseRequest<I>::send() {
-  send_prepare_lock();
-}
-
-template <typename I>
-void PreReleaseRequest<I>::send_prepare_lock() {
-  if (m_shutting_down) {
-    send_cancel_op_requests();
-    return;
-  }
-
-  CephContext *cct = m_image_ctx.cct;
-  ldout(cct, 10) << dendl;
-
-  // release the lock if the image is not busy performing other actions
-  Context *ctx = create_context_callback<
-    PreReleaseRequest<I>, &PreReleaseRequest<I>::handle_prepare_lock>(this);
-  m_image_ctx.state->prepare_lock(ctx);
-}
-
-template <typename I>
-void PreReleaseRequest<I>::handle_prepare_lock(int r) {
-  CephContext *cct = m_image_ctx.cct;
-  ldout(cct, 10) << "r=" << r << dendl;
-
   send_cancel_op_requests();
 }
 
@@ -100,43 +79,44 @@ void PreReleaseRequest<I>::handle_cancel_op_requests(int r) {
 
   ceph_assert(r == 0);
 
-  send_block_writes();
+  send_set_require_lock();
 }
 
 template <typename I>
-void PreReleaseRequest<I>::send_block_writes() {
+void PreReleaseRequest<I>::send_set_require_lock() {
+  if (!m_image_ctx.test_features(RBD_FEATURE_EXCLUSIVE_LOCK)) {
+    // exclusive-lock was disabled, no need to block IOs
+    send_wait_for_ops();
+    return;
+  }
+
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 10) << dendl;
 
   using klass = PreReleaseRequest<I>;
   Context *ctx = create_context_callback<
-    klass, &klass::handle_block_writes>(this);
+    klass, &klass::handle_set_require_lock>(this);
 
   // setting the lock as required will automatically cause the IO
   // queue to re-request the lock if any IO is queued
   if (m_image_ctx.clone_copy_on_read ||
       m_image_ctx.test_features(RBD_FEATURE_JOURNALING)) {
-    m_image_dispatch->set_require_lock(io::DIRECTION_BOTH, ctx);
+    m_image_dispatch->set_require_lock(m_shutting_down,
+                                       io::DIRECTION_BOTH, ctx);
   } else {
-    m_image_dispatch->set_require_lock(io::DIRECTION_WRITE, ctx);
+    m_image_dispatch->set_require_lock(m_shutting_down,
+                                       io::DIRECTION_WRITE, ctx);
   }
 }
 
 template <typename I>
-void PreReleaseRequest<I>::handle_block_writes(int r) {
+void PreReleaseRequest<I>::handle_set_require_lock(int r) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 10) << "r=" << r << dendl;
 
-  if (r == -EBLACKLISTED) {
-    // allow clean shut down if blacklisted
-    lderr(cct) << "failed to block writes because client is blacklisted"
-               << dendl;
-  } else if (r < 0) {
-    lderr(cct) << "failed to block writes: " << cpp_strerror(r) << dendl;
-    m_image_dispatch->unset_require_lock(io::DIRECTION_BOTH);
-    save_result(r);
-    finish();
-    return;
+  if (r < 0) {
+    // IOs are still flushed regardless of the error
+    lderr(cct) << "failed to set lock: " << cpp_strerror(r) << dendl;
   }
 
   send_wait_for_ops();
@@ -157,36 +137,53 @@ void PreReleaseRequest<I>::handle_wait_for_ops(int r) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 10) << dendl;
 
-  send_shut_down_image_cache();
+  send_prepare_lock();
 }
 
 template <typename I>
-void PreReleaseRequest<I>::send_shut_down_image_cache() {
+void PreReleaseRequest<I>::send_prepare_lock() {
+  if (m_shutting_down) {
+    send_process_plugin_release_lock();
+    return;
+  }
+
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 10) << dendl;
 
-  /* Shut down existing image cache whether the feature bit is on or not */
-  if (!m_image_ctx.image_cache) {
-     send_invalidate_cache();
-    return;
-  }
-  std::shared_lock owner_lock{m_image_ctx.owner_lock};
-  Context *ctx = create_async_context_callback(m_image_ctx, create_context_callback<
-      PreReleaseRequest<I>,
-      &PreReleaseRequest<I>::handle_shut_down_image_cache>(this));
-  cache::rwl::ShutdownRequest<I> *req = cache::rwl::ShutdownRequest<I>::create(
-    m_image_ctx, ctx);
-  req->send();
+  // release the lock if the image is not busy performing other actions
+  Context *ctx = create_context_callback<
+    PreReleaseRequest<I>, &PreReleaseRequest<I>::handle_prepare_lock>(this);
+  m_image_ctx.state->prepare_lock(ctx);
 }
 
 template <typename I>
-void PreReleaseRequest<I>::handle_shut_down_image_cache(int r) {
+void PreReleaseRequest<I>::handle_prepare_lock(int r) {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << "r=" << r << dendl;
+
+  send_process_plugin_release_lock();
+}
+
+template <typename I>
+void PreReleaseRequest<I>::send_process_plugin_release_lock() {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << dendl;
+
+  std::shared_lock owner_lock{m_image_ctx.owner_lock};
+  Context *ctx = create_async_context_callback(m_image_ctx, create_context_callback<
+      PreReleaseRequest<I>,
+      &PreReleaseRequest<I>::handle_process_plugin_release_lock>(this));
+  m_image_ctx.plugin_registry->prerelease_exclusive_lock(ctx);
+}
+
+template <typename I>
+void PreReleaseRequest<I>::handle_process_plugin_release_lock(int r) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 10) << "r=" << r << dendl;
 
   if (r < 0) {
-    lderr(cct) << "failed to shut down image cache: " << cpp_strerror(r)
-               << dendl;
+    lderr(cct) << "failed to handle plugins before releasing lock: "
+               << cpp_strerror(r) << dendl;
     m_image_dispatch->unset_require_lock(io::DIRECTION_BOTH);
     save_result(r);
     finish();
@@ -201,11 +198,10 @@ void PreReleaseRequest<I>::send_invalidate_cache() {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 10) << dendl;
 
-  std::shared_lock owner_lock{m_image_ctx.owner_lock};
   Context *ctx = create_context_callback<
       PreReleaseRequest<I>,
       &PreReleaseRequest<I>::handle_invalidate_cache>(this);
-  m_image_ctx.io_object_dispatcher->invalidate_cache(ctx);
+  m_image_ctx.io_image_dispatcher->invalidate_cache(ctx);
 }
 
 template <typename I>
@@ -213,13 +209,43 @@ void PreReleaseRequest<I>::handle_invalidate_cache(int r) {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 10) << "r=" << r << dendl;
 
-  if (r < 0 && r != -EBLACKLISTED && r != -EBUSY) {
+  if (r < 0 && r != -EBLOCKLISTED && r != -EBUSY) {
     lderr(cct) << "failed to invalidate cache: " << cpp_strerror(r)
                << dendl;
     m_image_dispatch->unset_require_lock(io::DIRECTION_BOTH);
     save_result(r);
     finish();
     return;
+  }
+
+  send_flush_io();
+}
+
+template <typename I>
+void PreReleaseRequest<I>::send_flush_io() {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << dendl;
+
+  // ensure that all in-flight IO is flushed -- skipping the refresh layer
+  // since it should have been flushed when the lock was required and now
+  // refreshes are disabled / interlocked w/ this state machine.
+  auto ctx = create_context_callback<
+      PreReleaseRequest<I>, &PreReleaseRequest<I>::handle_flush_io>(this);
+  auto aio_comp = io::AioCompletion::create_and_start(
+    ctx, util::get_image_ctx(&m_image_ctx), librbd::io::AIO_TYPE_FLUSH);
+  auto req = io::ImageDispatchSpec::create_flush(
+    m_image_ctx, io::IMAGE_DISPATCH_LAYER_EXCLUSIVE_LOCK, aio_comp,
+    io::FLUSH_SOURCE_EXCLUSIVE_LOCK_SKIP_REFRESH, {});
+  req->send();
+}
+
+template <typename I>
+void PreReleaseRequest<I>::handle_flush_io(int r) {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << "r=" << r << dendl;
+
+  if (r < 0) {
+    lderr(cct) << "failed to flush IO: " << cpp_strerror(r) << dendl;
   }
 
   send_flush_notifies();

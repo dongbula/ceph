@@ -35,7 +35,7 @@ get_cmake_variable() {
 
 [ -z "$BUILD_DIR" ] && BUILD_DIR=build
 CURR_DIR=`pwd`
-LOCAL_BUILD_DIR="$CURR_DIR/../../../../$BUILD_DIR"
+LOCAL_BUILD_DIR=$(cd "$CURR_DIR/../../../../$BUILD_DIR"; pwd)
 
 setup_teuthology() {
     TEMP_DIR=`mktemp -d`
@@ -80,11 +80,14 @@ display_log() {
 }
 
 on_tests_error() {
-    if [[ -n "$JENKINS_HOME" ]]; then
+    local ret=$?
+    if [[ -n "$JENKINS_HOME" && -z "$ON_TESTS_ERROR_RUN" ]]; then
         CEPH_OUT_DIR=${CEPH_OUT_DIR:-"$LOCAL_BUILD_DIR"/out}
-        display_log "mgr" 100000
-        display_log "osd" 100000
+        display_log "mgr" 1500
+        display_log "osd" 1000
+        ON_TESTS_ERROR_RUN=1
     fi
+    return $ret
 }
 
 run_teuthology_tests() {
@@ -116,8 +119,7 @@ run_teuthology_tests() {
     local python_common_dir=$source_dir/src/python-common
     # In CI environment we set python paths inside build (where you find the required frontend build: "dist" dir).
     if [[ -n "$JENKINS_HOME" ]]; then
-        export PYBIND=$LOCAL_BUILD_DIR/src/pybind
-        pybind_dir=$PYBIND
+        pybind_dir+=":$LOCAL_BUILD_DIR/src/pybind"
     fi
     export PYTHONPATH=$source_dir/qa:$LOCAL_BUILD_DIR/lib/cython_modules/lib.3/:$pybind_dir:$python_common_dir:${COVERAGE_PATH}
     export RGW=${RGW:-1}
@@ -126,7 +128,8 @@ run_teuthology_tests() {
     export COVERAGE_FILE=.coverage.mgr.dashboard
     find . -iname "*${COVERAGE_FILE}*" -type f -delete
 
-    python ../qa/tasks/vstart_runner.py --ignore-missing-binaries $OPTIONS $(echo $TEST_CASES)
+    python ../qa/tasks/vstart_runner.py --ignore-missing-binaries --no-verbose $OPTIONS $(echo $TEST_CASES) ||
+      on_tests_error
 
     deactivate
     cd $CURR_DIR

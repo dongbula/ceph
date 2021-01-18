@@ -1,20 +1,44 @@
 import ceph_module  # noqa
 
-try:
-    from typing import Set, Tuple, Iterator, Any, Dict, Optional, Callable, List
-except ImportError:
-    # just for type checking
-    pass
+from typing import Set, Tuple, Iterator, Any, Dict, Generic, Optional, Callable, List, \
+    Union, TYPE_CHECKING, NamedTuple
+if TYPE_CHECKING:
+    import sys
+    if sys.version_info >= (3, 8):
+        from typing import Literal
+    else:
+        from typing_extensions import Literal
+
+import inspect
 import logging
 import errno
+import functools
 import json
 import threading
 from collections import defaultdict, namedtuple
 import rados
 import re
+import sys
 import time
+from ceph_argparse import CephArgtype
 from mgr_util import profile_method
 
+if sys.version_info >= (3, 8):
+    from typing import get_args, get_origin
+else:
+    def get_args(tp):
+        if tp is Generic:
+            return tp
+        else:
+            return getattr(tp, '__args__', ())
+
+    def get_origin(tp):
+        return getattr(tp, '__origin__', None)
+
+
+ERROR_MSG_EMPTY_INPUT_FILE = 'Empty content: please add a password/secret to the file.'
+ERROR_MSG_NO_INPUT_FILE = 'Please specify the file containing the password/secret with "-i" option.'
+# Full list of strings in "osd_types.cc:pg_state_string()"
 PG_STATES = [
     "active",
     "clean",
@@ -45,7 +69,12 @@ PG_STATES = [
     "snaptrim_wait",
     "snaptrim_error",
     "creating",
-    "unknown"]
+    "unknown",
+    "premerge",
+    "failed_repair",
+    "laggy",
+    "wait",
+]
 
 
 class CommandResult(object):
@@ -228,8 +257,8 @@ class CRUSHMap(ceph_module.BasePyCRUSH):
             return None
 
         try:
-            first_take = [s for s in rule['steps'] if s['op'] == 'take'][0]
-        except IndexError:
+            first_take = next(s for s in rule['steps'] if s.get('op') == 'take')
+        except StopIteration:
             logging.warning("CRUSH rule '{0}' has no 'take' step".format(
                 rule_name))
             return None
@@ -271,40 +300,80 @@ class CRUSHMap(ceph_module.BasePyCRUSH):
 class CLICommand(object):
     COMMANDS = {}  # type: Dict[str, CLICommand]
 
-    def __init__(self, prefix, args="", desc="", perm="rw"):
+    def __init__(self, prefix, perm="rw"):
         self.prefix = prefix
-        self.args = args
-        self.args_dict = {}
-        self.desc = desc
         self.perm = perm
         self.func = None  # type: Optional[Callable]
-        self._parse_args()
+        self.arg_spec = {}    # type: Dict[str, Any]
+        self.first_default = -1
 
-    def _parse_args(self):
-        if not self.args:
-            return
-        args = self.args.split(" ")
-        for arg in args:
-            arg_desc = arg.strip().split(",")
-            arg_d = {}
-            for kv in arg_desc:
-                k, v = kv.split("=")
-                if k != "name":
-                    arg_d[k] = v
-                else:
-                    self.args_dict[v] = arg_d
+    KNOWN_ARGS = '_', 'self', 'mgr', 'inbuf', 'return'
+
+    @staticmethod
+    def load_func_metadata(f):
+        desc = inspect.getdoc(f) or ''
+        full_argspec = inspect.getfullargspec(f)
+        arg_spec = full_argspec.annotations
+        first_default = len(arg_spec)
+        if full_argspec.defaults:
+            first_default -= len(full_argspec.defaults)
+        args = []
+        for index, arg in enumerate(full_argspec.args):
+            if arg in CLICommand.KNOWN_ARGS:
+                continue
+            assert arg in arg_spec, \
+                f"'{arg}' is not annotated for {f}: {full_argspec}"
+            has_default = index >= first_default
+            args.append(CephArgtype.to_argdesc(arg_spec[arg],
+                                               dict(name=arg),
+                                               has_default))
+        return desc, arg_spec, first_default, ' '.join(args)
+
+    def store_func_metadata(self, f):
+        self.desc, self.arg_spec, self.first_default, self.args = \
+            self.load_func_metadata(f)
 
     def __call__(self, func):
+        self.store_func_metadata(func)
         self.func = func
         self.COMMANDS[self.prefix] = self
         return self.func
 
-    def call(self, mgr, cmd_dict, inbuf):
+    def _get_arg_value(self, kwargs_switch, key, val):
+        def start_kwargs():
+            if isinstance(val, str) and '=' in val:
+                k, v = val.split('=', 1)
+                if k in self.arg_spec:
+                    return True
+            else:
+                return False
+        if not kwargs_switch:
+            kwargs_switch = start_kwargs()
+
+        if kwargs_switch:
+            k, v = val.split('=', 1)
+        else:
+            k, v = key, val
+        return kwargs_switch, k.replace('-', '_'), v
+
+    def _collect_args_by_argspec(self, cmd_dict):
         kwargs = {}
-        for a, d in self.args_dict.items():
-            if 'req' in d and d['req'] == "false" and a not in cmd_dict:
+        kwargs_switch = False
+        for index, (name, tp) in enumerate(self.arg_spec.items()):
+            if name in CLICommand.KNOWN_ARGS:
                 continue
-            kwargs[a.replace("-", "_")] = cmd_dict[a]
+            assert self.first_default >= 0
+            raw_v = cmd_dict.get(name)
+            if index >= self.first_default:
+                if raw_v is None:
+                    continue
+            kwargs_switch, k, v = self._get_arg_value(kwargs_switch,
+                                                      name, raw_v)
+            kwargs[k] = CephArgtype.cast_to(tp, v)
+        return kwargs
+
+    def call(self, mgr, cmd_dict, inbuf):
+        kwargs = self._collect_args_by_argspec(cmd_dict)
         if inbuf:
             kwargs['inbuf'] = inbuf
         assert self.func
@@ -322,42 +391,66 @@ class CLICommand(object):
         return [cmd.dump_cmd() for cmd in cls.COMMANDS.values()]
 
 
-def CLIReadCommand(prefix, args="", desc=""):
-    return CLICommand(prefix, args, desc, "r")
+def CLIReadCommand(prefix):
+    return CLICommand(prefix, "r")
 
 
-def CLIWriteCommand(prefix, args="", desc=""):
-    return CLICommand(prefix, args, desc, "w")
+def CLIWriteCommand(prefix):
+    return CLICommand(prefix, "w")
+
+
+def CLICheckNonemptyFileInput(func):
+    @functools.wraps(func)
+    def check(*args, **kwargs):
+        if 'inbuf' not in kwargs:
+            return -errno.EINVAL, '', ERROR_MSG_NO_INPUT_FILE
+        if not kwargs['inbuf'] or (isinstance(kwargs['inbuf'], str)
+                                   and not kwargs['inbuf'].strip('\n')):
+            return -errno.EINVAL, '', ERROR_MSG_EMPTY_INPUT_FILE
+        return func(*args, **kwargs)
+    check.__signature__ = inspect.signature(func)  # type: ignore[attr-defined]
+    return check
 
 
 def _get_localized_key(prefix, key):
     return '{}/{}'.format(prefix, key)
 
+"""
+MODULE_OPTIONS types and Option Class
+"""
+if TYPE_CHECKING:
+    OptionTypeLabel = Literal[
+        'uint', 'int', 'str', 'float', 'bool', 'addr', 'addrvec', 'uuid', 'size', 'secs']
 
-class Option(dict):
+
+# common/options.h: value_t
+OptionValue = Optional[Union[bool, int, float, str]]
+
+
+class Option(Dict):
     """
     Helper class to declare options for MODULE_OPTIONS list.
-
-    Caveat: it uses argument names matching Python keywords (type, min, max),
-    so any further processing should happen in a separate method.
-
-    TODO: type validation.
+    TODO: Replace with typing.TypedDict when in python_version >= 3.8
     """
 
     def __init__(
-            self, name,
-            default=None,
-            type='str',
-            desc=None, longdesc=None,
-            min=None, max=None,
-            enum_allowed=None,
-            see_also=None,
-            tags=None,
-            runtime=False,
+            self,
+            name: str,
+            default: OptionValue=None,
+            type: 'OptionTypeLabel'='str',
+            desc: Optional[str]=None,
+            long_desc: Optional[str]=None,
+            min: OptionValue=None,
+            max: OptionValue=None,
+            enum_allowed: Optional[List[str]]=None,
+            tags: Optional[List[str]]=None,
+            see_also: Optional[List[str]]=None,
+            runtime: bool=False,
     ):
         super(Option, self).__init__(
             (k, v) for k, v in vars().items()
             if k != 'self' and v is not None)
+
 
 class Command(dict):
     """
@@ -377,20 +470,23 @@ class Command(dict):
     def __init__(
             self,
             prefix,
-            args=None,
+            handler,
             perm="rw",
-            desc=None,
             poll=False,
-            handler=None
     ):
-        super(Command, self).__init__(
-            cmd=prefix + (' ' + args if args else ''),
-            perm=perm,
-            desc=desc,
-            poll=poll)
+        super().__init__(perm=perm,
+                         poll=poll)
         self.prefix = prefix
-        self.args = args
         self.handler = handler
+
+    @staticmethod
+    def returns_command_result(instance, f):
+        @functools.wraps(f)
+        def wrapper(mgr, *args, **kwargs):
+            retval, stdout, stderr = f(instance or mgr, *args, **kwargs)
+            return HandleCommandResult(retval, stdout, stderr)
+        wrapper.__signature__ = inspect.signature(f)  # type: ignore[attr-defined]
+        return wrapper
 
     def register(self, instance=False):
         """
@@ -400,15 +496,8 @@ class Command(dict):
         It also uses HandleCommandResult helper to return a wrapped a tuple of 3
         items.
         """
-        return CLICommand(
-            prefix=self.prefix,
-            args=self.args,
-            desc=self['desc'],
-            perm=self['perm']
-        )(
-            func=lambda mgr, *args, **kwargs: HandleCommandResult(*self.handler(
-                *((instance or mgr,) + args), **kwargs))
-        )
+        cmd = CLICommand(prefix=self.prefix, perm=self['perm'])
+        return cmd(self.returns_command_result(instance, self.handler))
 
 
 class CPlusPlusHandler(logging.Handler):
@@ -421,6 +510,7 @@ class CPlusPlusHandler(logging.Handler):
     def emit(self, record):
         if record.levelno >= self.level:
             self._module._ceph_log(self.format(record))
+
 
 class ClusterLogHandler(logging.Handler):
     def __init__(self, module_inst):
@@ -441,6 +531,7 @@ class ClusterLogHandler(logging.Handler):
             self._module.cluster_log(self._module.module_name,
                                      level,
                                      self.format(record))
+
 
 class FileHandler(logging.FileHandler):
     def __init__(self, module_inst):
@@ -479,7 +570,6 @@ class MgrModuleLoggingMixin(object):
 
         self._root_logger.setLevel(logging.NOTSET)
         self._set_log_level(mgr_level, module_level, cluster_level)
-
 
     def _unconfigure_logging(self):
         # remove existing handlers:
@@ -577,7 +667,7 @@ class MgrStandbyModule(ceph_module.BaseMgrStandbyModule, MgrModuleLoggingMixin):
     from their active peer), and to configuration settings (read only).
     """
 
-    MODULE_OPTIONS = []  # type: List[Dict[str, Any]]
+    MODULE_OPTIONS: List[Option] = []
     MODULE_OPTION_DEFAULTS = {}  # type: Dict[str, Any]
 
     def __init__(self, module_name, capsule):
@@ -640,13 +730,11 @@ class MgrStandbyModule(ceph_module.BaseMgrStandbyModule, MgrModuleLoggingMixin):
     def get_mgr_id(self):
         return self._ceph_get_mgr_id()
 
-    def get_module_option(self, key, default=None):
+    def get_module_option(self, key: str, default: OptionValue=None) -> OptionValue:
         """
         Retrieve the value of a persistent configuration setting
 
-        :param str key:
         :param default: the default value of the config if it is not found
-        :return: str
         """
         r = self._ceph_get_module_option(key)
         if r is None:
@@ -669,7 +757,7 @@ class MgrStandbyModule(ceph_module.BaseMgrStandbyModule, MgrModuleLoggingMixin):
     def get_active_uri(self):
         return self._ceph_get_active_uri()
 
-    def get_localized_module_option(self, key, default=None):
+    def get_localized_module_option(self, key: str, default: OptionValue=None) -> OptionValue:
         r = self._ceph_get_module_option(key, self.get_mgr_id())
         if r is None:
             return self.MODULE_OPTION_DEFAULTS.get(key, default)
@@ -679,7 +767,7 @@ class MgrStandbyModule(ceph_module.BaseMgrStandbyModule, MgrModuleLoggingMixin):
 
 class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
     COMMANDS = []  # type: List[Any]
-    MODULE_OPTIONS = []  # type: List[dict]
+    MODULE_OPTIONS: List[Option] = []
     MODULE_OPTION_DEFAULTS = {}  # type: Dict[str, Any]
 
     # Priority definitions for perf counters
@@ -743,7 +831,6 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
 
         # Keep a librados instance for those that need it.
         self._rados = None
-
 
     def __del__(self):
         self._unconfigure_logging()
@@ -1057,7 +1144,7 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         """
         return self._ceph_get_server(None)
 
-    def get_metadata(self, svc_type, svc_id):
+    def get_metadata(self, svc_type, svc_id, default=None):
         """
         Fetch the daemon metadata for a particular service.
 
@@ -1070,7 +1157,10 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
             calling this
         :rtype: dict, or None if no metadata found
         """
-        return self._ceph_get_metadata(svc_type, svc_id)
+        metadata = self._ceph_get_metadata(svc_type, svc_id)
+        if metadata is None:
+            return default
+        return metadata
 
     def get_daemon_status(self, svc_type, svc_id):
         """
@@ -1085,18 +1175,18 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         """
         return self._ceph_get_daemon_status(svc_type, svc_id)
 
-    def check_mon_command(self, cmd_dict: dict) -> HandleCommandResult:
+    def check_mon_command(self, cmd_dict: dict, inbuf: Optional[str]=None) -> HandleCommandResult:
         """
         Wrapper around :func:`~mgr_module.MgrModule.mon_command`, but raises,
         if ``retval != 0``.
         """
 
-        r = HandleCommandResult(*self.mon_command(cmd_dict))
+        r = HandleCommandResult(*self.mon_command(cmd_dict, inbuf))
         if r.retval:
             raise MonCommandFailed(f'{cmd_dict["prefix"]} failed: {r.stderr} retval: {r.retval}')
         return r
 
-    def mon_command(self, cmd_dict):
+    def mon_command(self, cmd_dict: dict, inbuf: Optional[str]=None):
         """
         Helper for modules that do simple, synchronous mon command
         execution.
@@ -1108,7 +1198,7 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
 
         t1 = time.time()
         result = CommandResult()
-        self.send_command(result, "mon", "", json.dumps(cmd_dict), "")
+        self.send_command(result, "mon", "", json.dumps(cmd_dict), "", inbuf)
         r = result.wait()
         t2 = time.time()
 
@@ -1118,7 +1208,14 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
 
         return r
 
-    def send_command(self, *args, **kwargs):
+    def send_command(
+            self,
+            result: CommandResult,
+            svc_type: str,
+            svc_id: str,
+            command: str,
+            tag: str,
+            inbuf: Optional[str]=None):
         """
         Called by the plugin to send a command to the mon
         cluster.
@@ -1138,8 +1235,9 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
             completes, the ``notify()`` callback on the MgrModule instance is
             triggered, with notify_type set to "command", and notify_id set to
             the tag of the command.
+        :param str inbuf: input buffer for sending additional data.
         """
-        self._ceph_send_command(*args, **kwargs)
+        self._ceph_send_command(result, svc_type, svc_id, command, tag, inbuf)
 
     def set_health_checks(self, checks):
         """
@@ -1166,13 +1264,13 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         """
         self._ceph_set_health_checks(checks)
 
-    def _handle_command(self, inbuf, cmd):
+    def _handle_command(self, inbuf: str, cmd: Dict[str, Any]):
         if cmd['prefix'] not in CLICommand.COMMANDS:
             return self.handle_command(inbuf, cmd)
 
         return CLICommand.COMMANDS[cmd['prefix']].call(self, cmd, inbuf)
 
-    def handle_command(self, inbuf, cmd):
+    def handle_command(self, inbuf: str, cmd: Dict[str, Any]):
         """
         Called by ceph-mgr to request the plugin to handle one
         of the commands that it declared in self.COMMANDS
@@ -1223,28 +1321,23 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         else:
             return r
 
-    def get_module_option(self, key, default=None):
+    def get_module_option(self, key: str, default: OptionValue=None) -> OptionValue:
         """
         Retrieve the value of a persistent configuration setting
-
-        :param str key:
-        :param str default:
-        :return: str
         """
         self._validate_module_option(key)
         return self._get_module_option(key, default)
 
-    def get_module_option_ex(self, module, key, default=None):
+    def get_module_option_ex(self, module: str, key: str, default: OptionValue=None) -> OptionValue:
         """
         Retrieve the value of a persistent configuration setting
         for the specified module.
 
-        :param str module: The name of the module, e.g. 'dashboard'
+        :param module: The name of the module, e.g. 'dashboard'
             or 'telemetry'.
-        :param str key: The configuration key, e.g. 'server_addr'.
-        :param str,None default: The default value to use when the
+        :param key: The configuration key, e.g. 'server_addr'.
+        :param default: The default value to use when the
             returned value is ``None``. Defaults to ``None``.
-        :return: str,int,bool,float,None
         """
         if module == self.module_name:
             self._validate_module_option(key)
@@ -1264,12 +1357,9 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
     def _set_localized(self, key, val, setter):
         return setter(_get_localized_key(self.get_mgr_id(), key), val)
 
-    def get_localized_module_option(self, key, default=None):
+    def get_localized_module_option(self, key: str, default: OptionValue=None) -> OptionValue:
         """
         Retrieve localized configuration for this ceph-mgr instance
-        :param str key:
-        :param str default:
-        :return: str
         """
         self._validate_module_option(key)
         return self._get_module_option(key, default, self.get_mgr_id())
@@ -1467,10 +1557,11 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
 
         return self._ceph_have_mon_connection()
 
-    def update_progress_event(self, evid, desc, progress):
+    def update_progress_event(self, evid, desc, progress, add_to_ceph_s):
         return self._ceph_update_progress_event(str(evid),
                                                 str(desc),
-                                                float(progress))
+                                                float(progress),
+                                                bool(add_to_ceph_s))
 
     def complete_progress_event(self, evid):
         return self._ceph_complete_progress_event(str(evid))
@@ -1578,6 +1669,51 @@ class MgrModule(ceph_module.BaseMgrModule, MgrModuleLoggingMixin):
         :param int query_id: query ID
         """
         return self._ceph_get_osd_perf_counters(query_id)
+
+    def add_mds_perf_query(self, query):
+        """
+        Register an MDS perf query.  Argument is a
+        dict of the query parameters, in this form:
+
+        ::
+
+           {
+             'key_descriptor': [
+               {'type': subkey_type, 'regex': regex_pattern},
+               ...
+             ],
+             'performance_counter_descriptors': [
+               list, of, descriptor, types
+             ],
+           }
+
+        NOTE: 'limit' and 'order_by' are not supported (yet).
+
+        Valid subkey types:
+           'mds_rank', 'client_id'
+        Valid performance counter types:
+           'cap_hit_metric'
+
+        :param object query: query
+        :rtype: int (query id)
+        """
+        return self._ceph_add_mds_perf_query(query)
+
+    def remove_mds_perf_query(self, query_id):
+        """
+        Unregister an MDS perf query.
+
+        :param int query_id: query ID
+        """
+        return self._ceph_remove_mds_perf_query(query_id)
+
+    def get_mds_perf_counters(self, query_id):
+        """
+        Get stats collected for an MDS perf query.
+
+        :param int query_id: query ID
+        """
+        return self._ceph_get_mds_perf_counters(query_id)
 
     def is_authorized(self, arguments):
         """

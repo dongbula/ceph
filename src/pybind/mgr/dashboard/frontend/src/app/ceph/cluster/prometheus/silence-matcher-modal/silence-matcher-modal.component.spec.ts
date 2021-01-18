@@ -4,16 +4,16 @@ import { ReactiveFormsModule } from '@angular/forms';
 import { RouterTestingModule } from '@angular/router/testing';
 
 import { NgbActiveModal, NgbTypeaheadModule } from '@ng-bootstrap/ng-bootstrap';
-import * as _ from 'lodash';
+import _ from 'lodash';
 import { of } from 'rxjs';
 
+import { SharedModule } from '~/app/shared/shared.module';
 import {
   configureTestBed,
   FixtureHelper,
   FormHelper,
   PrometheusHelper
-} from '../../../../../testing/unit-test-helper';
-import { SharedModule } from '../../../../shared/shared.module';
+} from '~/testing/unit-test-helper';
 import { SilenceMatcherModalComponent } from './silence-matcher-modal.component';
 
 describe('SilenceMatcherModalComponent', () => {

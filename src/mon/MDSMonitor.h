@@ -32,7 +32,7 @@ class FileSystemCommandHandler;
 
 class MDSMonitor : public PaxosService, public PaxosFSMap, protected CommandHandler {
  public:
-  MDSMonitor(Monitor *mn, Paxos *p, std::string service_name);
+  MDSMonitor(Monitor &mn, Paxos &p, std::string service_name);
 
   // service methods
   void create_initial() override;
@@ -66,11 +66,11 @@ class MDSMonitor : public PaxosService, public PaxosFSMap, protected CommandHand
   int print_nodes(ceph::Formatter *f);
 
   /**
-   * Return true if a blacklist was done (i.e. OSD propose needed)
+   * Return true if a blocklist was done (i.e. OSD propose needed)
    */
   bool fail_mds_gid(FSMap &fsmap, mds_gid_t gid);
 
-  bool is_leader() const override { return mon->is_leader(); }
+  bool is_leader() const override { return mon.is_leader(); }
 
  protected:
   using mds_info_t = MDSMap::mds_info_t;
@@ -89,8 +89,7 @@ class MDSMonitor : public PaxosService, public PaxosFSMap, protected CommandHand
   bool prepare_offload_targets(MonOpRequestRef op);
 
   int fail_mds(FSMap &fsmap, std::ostream &ss,
-      const std::string &arg,
-      mds_info_t *failed_info);
+      const std::string &arg, mds_info_t *failed_info);
 
   bool preprocess_command(MonOpRequestRef op);
   bool prepare_command(MonOpRequestRef op);
@@ -126,10 +125,12 @@ class MDSMonitor : public PaxosService, public PaxosFSMap, protected CommandHand
   void remove_from_metadata(const FSMap &fsmap, MonitorDBStore::TransactionRef t);
   int load_metadata(std::map<mds_gid_t, Metadata>& m);
   void count_metadata(const std::string& field, ceph::Formatter *f);
+
 public:
   void count_metadata(const std::string& field, std::map<std::string,int> *out);
-protected:
+  void get_versions(std::map<std::string, std::list<std::string>> &versions);
 
+protected:
   // MDS daemon GID to latest health state from that GID
   std::map<uint64_t, MDSHealth> pending_daemon_health;
   std::set<uint64_t> pending_daemon_health_rm;

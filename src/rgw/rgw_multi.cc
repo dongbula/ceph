@@ -12,6 +12,7 @@
 #include "rgw_multi.h"
 #include "rgw_op.h"
 #include "rgw_sal.h"
+#include "rgw_sal_rados.h"
 
 #include "services/svc_sys_obj.h"
 #include "services/svc_tier_rados.h"
@@ -242,7 +243,7 @@ int abort_multipart_upload(rgw::sal::RGWRadosStore *store, CephContext *cct,
         RGWObjManifest::obj_iterator oiter = obj_part.manifest.obj_begin();
         if (oiter != obj_part.manifest.obj_end()) {
           rgw_obj head;
-          rgw_raw_obj raw_head = oiter.get_location().get_raw_obj(store->getRados());
+          rgw_raw_obj raw_head = oiter.get_location().get_raw_obj(store);
           RGWSI_Tier_RADOS::raw_obj_to_obj(bucket_info.bucket, raw_head, &head);
 
           rgw_obj_index_key key;

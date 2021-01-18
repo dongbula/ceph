@@ -34,6 +34,10 @@ using TCachedExtentRef = boost::intrusive_ptr<T>;
 /**
  * CachedExtent
  */
+namespace onode {
+  class DummyNodeExtent;
+  class TestReplayExtent;
+}
 class ExtentIndex;
 class CachedExtent : public boost::intrusive_ref_counter<
   CachedExtent, boost::thread_unsafe_counter> {
@@ -47,8 +51,23 @@ class CachedExtent : public boost::intrusive_ref_counter<
     INVALID                // Part of no ExtentIndex set
   } state = extent_state_t::INVALID;
   friend std::ostream &operator<<(std::ostream &, extent_state_t);
+  // allow a dummy extent to pretend it is at a specific state
+  friend class onode::DummyNodeExtent;
+  friend class onode::TestReplayExtent;
 
   uint32_t last_committed_crc = 0;
+
+  // Points at current version while in state MUTATION_PENDING
+  CachedExtentRef prior_instance;
+
+  /**
+   * dirty_from
+   *
+   * When dirty, indiciates the oldest journal entry which mutates
+   * this extent.
+   */
+  journal_seq_t dirty_from;
+
 public:
   /**
    *  duplicate_for_write
@@ -118,8 +137,10 @@ public:
     out << "CachedExtent(addr=" << this
 	<< ", type=" << get_type()
 	<< ", version=" << version
+	<< ", dirty_from=" << dirty_from
 	<< ", paddr=" << get_paddr()
 	<< ", state=" << state
+	<< ", last_committed_crc=" << last_committed_crc
 	<< ", refcount=" << use_count();
     print_detail(out);
     return out << ")";
@@ -215,6 +236,14 @@ public:
   }
 
   /**
+   * get_dirty_from
+   *
+   * Return journal location of oldest relevant delta.
+   */
+  auto get_dirty_from() const { return dirty_from; }
+
+
+  /**
    * get_paddr
    *
    * Returns current address of extent.  If is_initial_pending(), address will
@@ -231,9 +260,9 @@ public:
   }
 
   /// Returns crc32c of buffer
-  uint32_t get_crc32c(uint32_t crc=1) {
+  uint32_t get_crc32c() {
     return ceph_crc32c(
-      crc,
+      1,
       reinterpret_cast<const unsigned char *>(get_bptr().c_str()),
       get_length());
   }
@@ -312,10 +341,11 @@ private:
   }
 
 protected:
-  CachedExtent(CachedExtent &&other) = default;
+  CachedExtent(CachedExtent &&other) = delete;
   CachedExtent(ceph::bufferptr &&ptr) : ptr(std::move(ptr)) {}
   CachedExtent(const CachedExtent &other)
     : state(other.state),
+      dirty_from(other.dirty_from),
       ptr(other.ptr.c_str(), other.ptr.length()),
       version(other.version),
       poffset(other.poffset) {}
@@ -323,6 +353,7 @@ protected:
   struct share_buffer_t {};
   CachedExtent(const CachedExtent &other, share_buffer_t) :
     state(other.state),
+    dirty_from(other.dirty_from),
     ptr(other.ptr),
     version(other.version),
     poffset(other.poffset) {}
@@ -332,6 +363,10 @@ protected:
   template <typename T>
   static TCachedExtentRef<T> make_cached_extent_ref(bufferptr &&ptr) {
     return new T(std::move(ptr));
+  }
+
+  CachedExtentRef get_prior_instance() {
+    return prior_instance;
   }
 
   /// Sets last_committed_crc
@@ -464,6 +499,12 @@ public:
     extent.parent_index = nullptr;
   }
 
+  void replace(CachedExtent &to, CachedExtent &from) {
+    extent_index.replace_node(extent_index.s_iterator_to(from), to);
+    from.parent_index = nullptr;
+    to.parent_index = this;
+  }
+
   bool empty() const {
     return extent_index.empty();
   }
@@ -505,6 +546,7 @@ using LBAPinRef = std::unique_ptr<LBAPin>;
 class LBAPin {
 public:
   virtual void link_extent(LogicalCachedExtent *ref) = 0;
+  virtual void take_pin(LBAPin &pin) = 0;
   virtual extent_len_t get_length() const = 0;
   virtual paddr_t get_paddr() const = 0;
   virtual laddr_t get_laddr() const = 0;
@@ -566,8 +608,21 @@ public:
   bool is_logical() const final {
     return true;
   }
+
+  std::ostream &print_detail(std::ostream &out) const final;
 protected:
   virtual void apply_delta(const ceph::bufferlist &bl) = 0;
+  virtual std::ostream &print_detail_l(std::ostream &out) const {
+    return out;
+  }
+
+  virtual void logical_on_delta_write() {}
+
+  void on_delta_write(paddr_t record_block_offset) final {
+    assert(get_prior_instance());
+    pin->take_pin(*(get_prior_instance()->cast<LogicalCachedExtent>()->pin));
+    logical_on_delta_write();
+  }
 
 private:
   laddr_t laddr = L_ADDR_NULL;

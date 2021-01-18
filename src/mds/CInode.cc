@@ -16,7 +16,6 @@
 #include "common/errno.h"
 
 #include <string>
-#include <stdio.h>
 
 #include "CInode.h"
 #include "CDir.h"
@@ -45,12 +44,31 @@
 #include "mds/MDSContinuation.h"
 #include "mds/InoTable.h"
 #include "cephfs_features.h"
+#include "osdc/Objecter.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
 #define dout_prefix *_dout << "mds." << mdcache->mds->get_nodeid() << ".cache.ino(" << ino() << ") "
 
+void CInodeCommitOperation::update(ObjectOperation &op, inode_backtrace_t &bt) {
+  using ceph::encode;
+
+  op.priority = priority;
+  op.create(false);
+
+  bufferlist parent_bl;
+  encode(bt, parent_bl);
+  op.setxattr("parent", parent_bl);
+
+  // for the old pool there is no need to update the layout
+  if (!update_layout)
+    return;
+
+  bufferlist layout_bl;
+  encode(_layout, layout_bl, _features);
+  op.setxattr("layout", layout_bl);
+}
 
 class CInodeIOContext : public MDSIOContextBase
 {
@@ -100,7 +118,6 @@ std::string_view CInode::pin_name(int p) const
     case PIN_DIRTYRSTAT: return "dirtyrstat";
     case PIN_DIRTYPARENT: return "dirtyparent";
     case PIN_DIRWAITER: return "dirwaiter";
-    case PIN_SCRUBQUEUE: return "scrubqueue";
     default: return generic_pin_name(p);
   }
 }
@@ -165,10 +182,12 @@ ostream& operator<<(ostream& out, const CInode& in)
     out << " snaprealm=" << in.snaprealm;
 
   if (in.state_test(CInode::STATE_AMBIGUOUSAUTH)) out << " AMBIGAUTH";
-  if (in.state_test(CInode::STATE_NEEDSRECOVER)) out << " needsrecover";
-  if (in.state_test(CInode::STATE_RECOVERING)) out << " recovering";
-  if (in.state_test(CInode::STATE_DIRTYPARENT)) out << " dirtyparent";
-  if (in.state_test(CInode::STATE_MISSINGOBJS)) out << " missingobjs";
+  if (in.state_test(CInode::STATE_NEEDSRECOVER)) out << " NEEDSRECOVER";
+  if (in.state_test(CInode::STATE_RECOVERING)) out << " RECOVERING";
+  if (in.state_test(CInode::STATE_DIRTYPARENT)) out << " DIRTYPARENT";
+  if (in.state_test(CInode::STATE_MISSINGOBJS)) out << " MISSINGOBJS";
+  if (in.is_ephemeral_dist()) out << " DISTEPHEMERALPIN";
+  if (in.is_ephemeral_rand()) out << " RANDEPHEMERALPIN";
   if (in.is_freezing_inode()) out << " FREEZING=" << in.auth_pin_freeze_allowance;
   if (in.is_frozen_inode()) out << " FROZEN";
   if (in.is_frozen_auth_pin()) out << " FROZEN_AUTHPIN";
@@ -286,17 +305,9 @@ ostream& operator<<(ostream& out, const CInode& in)
   return out;
 }
 
-ostream& operator<<(ostream& out, const CInode::scrub_stamp_info_t& si)
-{
-  out << "{scrub_start_version: " << si.scrub_start_version
-      << ", scrub_start_stamp: " << si.scrub_start_stamp
-      << ", last_scrub_version: " << si.last_scrub_version
-      << ", last_scrub_stamp: " << si.last_scrub_stamp;
-  return out;
-}
-
 CInode::CInode(MDCache *c, bool auth, snapid_t f, snapid_t l) :
-    mdcache(c), first(f), last(l), item_dirty(this),
+    mdcache(c), first(f), last(l),
+    item_dirty(this),
     item_caps(this),
     item_open_file(this),
     item_dirty_parent(this),
@@ -468,10 +479,10 @@ void CInode::pop_and_dirty_projected_inode(LogSegment *ls, const MutationRef& mu
   if (mut)
     mut->remove_projected_node(this);
 
-  bool pool_update = get_inode()->layout.pool_id != front.inode->layout.pool_id;
-  bool pin_update = get_inode()->export_pin != front.inode->export_pin;
-  bool dist_update = get_inode()->export_ephemeral_distributed_pin !=
-		     front.inode->export_ephemeral_distributed_pin;
+  bool pool_updated = get_inode()->layout.pool_id != front.inode->layout.pool_id;
+  bool pin_updated = (get_inode()->export_pin != front.inode->export_pin) ||
+		     (get_inode()->export_ephemeral_distributed_pin !=
+		      front.inode->export_ephemeral_distributed_pin);
 
   reset_inode(std::move(front.inode));
   if (front.xattrs != get_xattrs())
@@ -484,12 +495,10 @@ void CInode::pop_and_dirty_projected_inode(LogSegment *ls, const MutationRef& mu
 
   mark_dirty(ls);
   if (get_inode()->is_backtrace_updated())
-    mark_dirty_parent(ls, pool_update);
+    mark_dirty_parent(ls, pool_updated);
 
-  if (pin_update)
+  if (pin_updated)
     maybe_export_pin(true);
-  if (dist_update)
-    maybe_ephemeral_dist_children(true);
 }
 
 sr_t *CInode::prepare_new_srnode(snapid_t snapid)
@@ -499,21 +508,6 @@ sr_t *CInode::prepare_new_srnode(snapid_t snapid)
 
   if (cur_srnode) {
     new_srnode = new sr_t(*cur_srnode);
-    if (!new_srnode->past_parents.empty()) {
-      // convert past_parents to past_parent_snaps
-      ceph_assert(snaprealm);
-      auto& snaps = snaprealm->get_snaps();
-      for (auto p : snaps) {
-	if (p >= new_srnode->current_parent_since)
-	  break;
-	if (!new_srnode->snaps.count(p))
-	  new_srnode->past_parent_snaps.insert(p);
-      }
-      new_srnode->seq = snaprealm->get_newest_seq();
-      new_srnode->past_parents.clear();
-    }
-    if (snaprealm)
-      snaprealm->past_parents_dirty = false;
   } else {
     if (snapid == 0)
       snapid = mdcache->get_global_snaprealm()->get_newest_seq();
@@ -605,18 +599,20 @@ void CInode::record_snaprealm_past_parent(sr_t *new_snap, SnapRealm *newparent)
   }
 }
 
-void CInode::record_snaprealm_parent_dentry(sr_t *new_snap, SnapRealm *newparent,
+void CInode::record_snaprealm_parent_dentry(sr_t *new_snap, SnapRealm *oldparent,
 					    CDentry *dn, bool primary_dn)
 {
   ceph_assert(new_snap->is_parent_global());
-  SnapRealm *oldparent = dn->get_dir()->inode->find_snaprealm();
+
+  if (!oldparent)
+    oldparent = dn->get_dir()->inode->find_snaprealm();
   auto& snaps = oldparent->get_snaps();
 
   if (!primary_dn) {
     auto p = snaps.lower_bound(dn->first);
     if (p != snaps.end())
       new_snap->past_parent_snaps.insert(p, snaps.end());
-  } else if (newparent != oldparent) {
+  } else {
     // 'last_destroyed' is used as 'current_parent_since'
     auto p = snaps.lower_bound(new_snap->last_destroyed);
     if (p != snaps.end())
@@ -640,32 +636,16 @@ void CInode::pop_projected_snaprealm(sr_t *next_snaprealm, bool early)
   if (next_snaprealm) {
     dout(10) << __func__ << (early ? " (early) " : " ")
 	     << next_snaprealm << " seq " << next_snaprealm->seq << dendl;
-    bool invalidate_cached_snaps = false;
-    if (!snaprealm) {
+    if (!snaprealm)
       open_snaprealm();
-    } else if (!snaprealm->srnode.past_parents.empty()) {
-      invalidate_cached_snaps = true;
-      // re-open past parents
-      snaprealm->close_parents();
 
-      dout(10) << " realm " << *snaprealm << " past_parents " << snaprealm->srnode.past_parents
-	       << " -> " << next_snaprealm->past_parents << dendl;
-    }
     auto old_flags = snaprealm->srnode.flags;
     snaprealm->srnode = *next_snaprealm;
     delete next_snaprealm;
 
     if ((snaprealm->srnode.flags ^ old_flags) & sr_t::PARENT_GLOBAL) {
-      snaprealm->close_parents();
       snaprealm->adjust_parent();
     }
-
-    // we should be able to open these up (or have them already be open).
-    bool ok = snaprealm->_open_parents(NULL);
-    ceph_assert(ok);
-
-    if (invalidate_cached_snaps)
-      snaprealm->invalidate_cached_snaps();
 
     if (snaprealm->parent)
       dout(10) << " realm " << *snaprealm << " parent " << *snaprealm->parent << dendl;
@@ -825,7 +805,7 @@ CDir *CInode::add_dirfrag(CDir *dir)
     dir->get(CDir::PIN_STICKY);
   }
 
-  maybe_pin();
+  maybe_export_pin();
 
   return dir;
 }
@@ -1328,7 +1308,33 @@ struct C_IO_Inode_StoredBacktrace : public CInodeIOContext {
   }
 };
 
-void CInode::store_backtrace(MDSContext *fin, int op_prio)
+
+void CInode::_commit_ops(int r, C_GatherBuilder &gather_bld,
+                         std::vector<CInodeCommitOperation> &ops_vec,
+                         inode_backtrace_t &bt)
+{
+  dout(10) << __func__ << dendl;
+
+  if (r < 0) {
+    mdcache->mds->handle_write_error_with_lock(r);
+    return;
+  }
+
+  SnapContext snapc;
+  object_t oid = get_object_name(ino(), frag_t(), "");
+
+  for (auto &op : ops_vec) {
+    ObjectOperation obj_op;
+    object_locator_t oloc(op.get_pool());
+    op.update(obj_op, bt);
+    mdcache->mds->objecter->mutate(oid, oloc, obj_op, snapc,
+                                   ceph::real_clock::now(),
+                                   0, gather_bld.new_sub());
+  }
+}
+
+void CInode::_store_backtrace(std::vector<CInodeCommitOperation> &ops_vec,
+                              inode_backtrace_t &bt, int op_prio)
 {
   dout(10) << __func__ << " on " << *this << dendl;
   ceph_assert(is_dirty_parent());
@@ -1339,40 +1345,15 @@ void CInode::store_backtrace(MDSContext *fin, int op_prio)
   auth_pin(this);
 
   const int64_t pool = get_backtrace_pool();
-  inode_backtrace_t bt;
   build_backtrace(pool, bt);
-  bufferlist parent_bl;
-  using ceph::encode;
-  encode(bt, parent_bl);
 
-  ObjectOperation op;
-  op.priority = op_prio;
-  op.create(false);
-  op.setxattr("parent", parent_bl);
-
-  bufferlist layout_bl;
-  encode(get_inode()->layout, layout_bl, mdcache->mds->mdsmap->get_up_features());
-  op.setxattr("layout", layout_bl);
-
-  SnapContext snapc;
-  object_t oid = get_object_name(ino(), frag_t(), "");
-  object_locator_t oloc(pool);
-  Context *fin2 = new C_OnFinisher(
-    new C_IO_Inode_StoredBacktrace(this, get_inode()->backtrace_version, fin),
-    mdcache->mds->finisher);
+  ops_vec.emplace_back(op_prio, pool, get_inode()->layout,
+                       mdcache->mds->mdsmap->get_up_features());
 
   if (!state_test(STATE_DIRTYPOOL) || get_inode()->old_pools.empty()) {
     dout(20) << __func__ << ": no dirtypool or no old pools" << dendl;
-    mdcache->mds->objecter->mutate(oid, oloc, op, snapc,
-				   ceph::real_clock::now(),
-				   0, fin2);
     return;
   }
-
-  C_GatherBuilder gather(g_ceph_context, fin2);
-  mdcache->mds->objecter->mutate(oid, oloc, op, snapc,
-				 ceph::real_clock::now(),
-				 0, gather.new_sub());
 
   // In the case where DIRTYPOOL is set, we update all old pools backtraces
   // such that anyone reading them will see the new pool ID in
@@ -1383,17 +1364,33 @@ void CInode::store_backtrace(MDSContext *fin, int op_prio)
 
     dout(20) << __func__ << ": updating old pool " << p << dendl;
 
-    ObjectOperation op;
-    op.priority = op_prio;
-    op.create(false);
-    op.setxattr("parent", parent_bl);
-
-    object_locator_t oloc(p);
-    mdcache->mds->objecter->mutate(oid, oloc, op, snapc,
-				   ceph::real_clock::now(),
-				   0, gather.new_sub());
+    ops_vec.emplace_back(op_prio, p);
   }
+}
+
+void CInode::store_backtrace(MDSContext *fin, int op_prio)
+{
+  std::vector<CInodeCommitOperation> ops_vec;
+  inode_backtrace_t bt;
+  auto version = get_inode()->backtrace_version;
+
+  _store_backtrace(ops_vec, bt, op_prio);
+
+  C_GatherBuilder gather(g_ceph_context,
+			 new C_OnFinisher(
+			   new C_IO_Inode_StoredBacktrace(this, version, fin),
+			   mdcache->mds->finisher));
+  _commit_ops(0, gather, ops_vec, bt);
+  ceph_assert(gather.has_subs());
   gather.activate();
+}
+
+void CInode::store_backtrace(CInodeCommitOperations &op, int op_prio)
+{
+  op.version = get_inode()->backtrace_version;
+  op.in = this;
+
+  _store_backtrace(op.ops_vec, op.bt, op_prio);
 }
 
 void CInode::_stored_backtrace(int r, version_t v, Context *fin)
@@ -2125,11 +2122,12 @@ void CInode::decode_lock_ipolicy(bufferlist::const_iterator& p)
     }
   }
   DECODE_FINISH(p);
-  mds_rank_t old_export_pin = get_inode()->export_pin;
-  bool old_ephemeral_pin = get_inode()->export_ephemeral_distributed_pin;
+
+  bool pin_updated = (get_inode()->export_pin != _inode->export_pin) ||
+		     (get_inode()->export_ephemeral_distributed_pin !=
+		      _inode->export_ephemeral_distributed_pin);
   reset_inode(std::move(_inode));
-  maybe_export_pin(old_export_pin != get_inode()->export_pin);
-  maybe_ephemeral_dist_children(old_ephemeral_pin != get_inode()->export_ephemeral_distributed_pin);
+  maybe_export_pin(pin_updated);
 }
 
 void CInode::encode_lock_state(int type, bufferlist& bl)
@@ -3116,7 +3114,6 @@ void CInode::close_snaprealm(bool nojoin)
 {
   if (snaprealm) {
     dout(15) << __func__ << " " << *snaprealm << dendl;
-    snaprealm->close_parents();
     if (snaprealm->parent) {
       snaprealm->parent->open_children.erase(snaprealm);
       //if (!nojoin)
@@ -3155,12 +3152,8 @@ void CInode::decode_snap_blob(const bufferlist& snapbl)
     auto old_flags = snaprealm->srnode.flags;
     auto p = snapbl.cbegin();
     decode(snaprealm->srnode, p);
-    if (is_base()) {
-      bool ok = snaprealm->_open_parents(NULL);
-      ceph_assert(ok);
-    } else {
+    if (!is_base()) {
       if ((snaprealm->srnode.flags ^ old_flags) & sr_t::PARENT_GLOBAL) {
-	snaprealm->close_parents();
 	snaprealm->adjust_parent();
       }
     }
@@ -3344,9 +3337,9 @@ void CInode::set_mds_caps_wanted(mempool::mds_co::compact_map<int32_t,int32_t>& 
   mds_caps_wanted.swap(m);
   if (old_empty != (bool)mds_caps_wanted.empty()) {
     if (old_empty)
-      adjust_num_caps_wanted(1);
+      adjust_num_caps_notable(1);
     else
-      adjust_num_caps_wanted(-1);
+      adjust_num_caps_notable(-1);
   }
 }
 
@@ -3356,23 +3349,12 @@ void CInode::set_mds_caps_wanted(mds_rank_t mds, int32_t wanted)
   if (wanted) {
     mds_caps_wanted[mds] = wanted;
     if (old_empty)
-      adjust_num_caps_wanted(1);
+      adjust_num_caps_notable(1);
   } else if (!old_empty) {
     mds_caps_wanted.erase(mds);
     if (mds_caps_wanted.empty())
-      adjust_num_caps_wanted(-1);
+      adjust_num_caps_notable(-1);
   }
-}
-
-void CInode::adjust_num_caps_wanted(int d)
-{
-  if (!num_caps_wanted && d > 0)
-    mdcache->open_file_table.add_inode(this);
-  else if (num_caps_wanted > 0 && num_caps_wanted == -d)
-    mdcache->open_file_table.remove_inode(this);
-
-  num_caps_wanted +=d;
-  ceph_assert(num_caps_wanted >= 0);
 }
 
 Capability *CInode::add_client_cap(client_t client, Session *session,
@@ -3419,8 +3401,8 @@ void CInode::remove_client_cap(client_t client)
   if (client == loner_cap)
     loner_cap = -1;
 
-  if (cap->wanted())
-    adjust_num_caps_wanted(-1);
+  if (cap->is_wanted_notable())
+    adjust_num_caps_notable(-1);
 
   client_caps.erase(it);
   if (client_caps.empty()) {
@@ -3656,6 +3638,38 @@ bool CInode::issued_caps_need_gather(SimpleLock *lock)
   return false;
 }
 
+void CInode::adjust_num_caps_notable(int d)
+{
+  if (!is_clientwriteable()) {
+    if (!num_caps_notable && d > 0)
+      mdcache->open_file_table.add_inode(this);
+    else if (num_caps_notable > 0 && num_caps_notable == -d)
+      mdcache->open_file_table.remove_inode(this);
+  }
+
+  num_caps_notable +=d;
+  ceph_assert(num_caps_notable >= 0);
+}
+
+void CInode::mark_clientwriteable()
+{
+  if (last != CEPH_NOSNAP)
+    return;
+  if (!state_test(STATE_CLIENTWRITEABLE)) {
+    if (num_caps_notable == 0)
+      mdcache->open_file_table.add_inode(this);
+    state_set(STATE_CLIENTWRITEABLE);
+  }
+}
+
+void CInode::clear_clientwriteable()
+{
+  if (state_test(STATE_CLIENTWRITEABLE)) {
+    if (num_caps_notable == 0)
+      mdcache->open_file_table.remove_inode(this);
+    state_clear(STATE_CLIENTWRITEABLE);
+  }
+}
 
 // =============================================
 
@@ -3710,6 +3724,7 @@ int CInode::encode_inodestat(bufferlist& bl, Session *session,
   }
 
   utime_t snap_btime;
+  std::map<std::string, std::string> snap_metadata;
   SnapRealm *realm = find_snaprealm();
   if (snapid != CEPH_NOSNAP && realm) {
     // add snapshot timestamp vxattr
@@ -3721,6 +3736,7 @@ int CInode::encode_inodestat(bufferlist& bl, Session *session,
       ceph_assert(infomap.size() == 1);
       const SnapInfo *si = infomap.begin()->second;
       snap_btime = si->stamp;
+      snap_metadata = si->metadata;
     }
   }
 
@@ -3771,23 +3787,9 @@ int CInode::encode_inodestat(bufferlist& bl, Session *session,
   }
 
   // max_size is min of projected, actual
-  uint64_t max_size;
-  {
-    auto it = oi->client_ranges.find(client);
-    if (it == oi->client_ranges.end()) {
-      max_size = 0;
-    } else {
-      max_size = it->second.range.last;
-      if (oi != pi) {
-	it = pi->client_ranges.find(client);
-	if (it == pi->client_ranges.end()) {
-	  max_size = 0;
-	} else {
-	  max_size = std::min(max_size, it->second.range.last);
-	}
-      }
-    }
-  }
+  uint64_t max_size =
+    std::min(oi->get_client_range(client),
+	     pi->get_client_range(client));
 
   // inline data
   version_t inline_version = 0;
@@ -3994,7 +3996,7 @@ int CInode::encode_inodestat(bufferlist& bl, Session *session,
    * note: encoding matches MClientReply::InodeStat
    */
   if (session->info.has_feature(CEPHFS_FEATURE_REPLY_ENCODING)) {
-    ENCODE_START(3, 1, bl);
+    ENCODE_START(6, 1, bl);
     encode(oi->ino, bl);
     encode(snapid, bl);
     encode(oi->rdev, bl);
@@ -4037,6 +4039,9 @@ int CInode::encode_inodestat(bufferlist& bl, Session *session,
     encode(any_i->change_attr, bl);
     encode(file_i->export_pin, bl);
     encode(snap_btime, bl);
+    encode(file_i->rstat.rsnaps, bl);
+    encode(snap_metadata, bl);
+    encode(file_i->fscrypt, bl);
     ENCODE_FINISH(bl);
   }
   else {
@@ -4139,24 +4144,9 @@ void CInode::encode_cap_message(const ref_t<MClientCaps> &m, Capability *cap)
   }
 
   // max_size is min of projected, actual.
-  {
-    uint64_t max_size;
-    auto it = oi->client_ranges.find(client);
-    if (it == oi->client_ranges.end()) {
-      max_size = 0;
-    } else {
-      max_size = it->second.range.last;
-      if (oi != pi) {
-	it = pi->client_ranges.find(client);
-	if (it == pi->client_ranges.end()) {
-	  max_size = 0;
-	} else {
-	  max_size = std::min(max_size, it->second.range.last);
-	}
-      }
-    }
-    m->max_size = max_size;
-  }
+  uint64_t oldms = oi->get_client_range(client);
+  uint64_t newms = pi->get_client_range(client);
+  m->max_size = std::min(oldms, newms);
 
   i = pauth ? pi:oi;
   m->head.mode = i->mode;
@@ -4396,13 +4386,8 @@ void CInode::decode_import(bufferlist::const_iterator& p,
     decode(s, p);
     s &= MASK_STATE_EXPORTED;
 
-    if (s & STATE_RANDEPHEMERALPIN) {
-      set_ephemeral_rand(true);
-    }
-    if (s & STATE_DISTEPHEMERALPIN) {
-      set_ephemeral_dist(true);
-    }
-
+    set_ephemeral_pin((s & STATE_DISTEPHEMERALPIN),
+		      (s & STATE_RANDEPHEMERALPIN));
     state_set(STATE_AUTH | s);
   }
 
@@ -4611,7 +4596,6 @@ void CInode::validate_disk_state(CInode::validated_data *results,
       set_callback(BACKTRACE, static_cast<Continuation::stagePtr>(&ValidationContinuation::_backtrace));
       set_callback(INODE, static_cast<Continuation::stagePtr>(&ValidationContinuation::_inode_disk));
       set_callback(DIRFRAGS, static_cast<Continuation::stagePtr>(&ValidationContinuation::_dirfrags));
-      set_callback(SNAPREALM, static_cast<Continuation::stagePtr>(&ValidationContinuation::_snaprealm));
     }
 
     ~ValidationContinuation() override {
@@ -4635,6 +4619,11 @@ void CInode::validate_disk_state(CInode::validated_data *results,
       fetch.getxattr("parent", bt, bt_r);
       in->mdcache->mds->objecter->read(oid, object_locator_t(pool), fetch, CEPH_NOSNAP,
 				       NULL, 0, fin);
+      if (in->mdcache->mds->logger) {
+        in->mdcache->mds->logger->inc(l_mds_openino_backtrace_fetch);
+        in->mdcache->mds->logger->inc(l_mds_scrub_backtrace_fetch);
+      }
+
       using ceph::encode;
       if (!is_internal) {
         ObjectOperation scrub_tag;
@@ -4645,24 +4634,21 @@ void CInode::validate_disk_state(CInode::validated_data *results,
         in->mdcache->mds->objecter->mutate(oid, object_locator_t(pool), scrub_tag, snapc,
 					   ceph::real_clock::now(),
 					   0, NULL);
+        if (in->mdcache->mds->logger)
+          in->mdcache->mds->logger->inc(l_mds_scrub_set_tag);
       }
     }
 
     bool _start(int rval) {
+      ceph_assert(in->can_auth_pin());
+      in->auth_pin(this);
+
       if (in->is_dirty()) {
 	MDCache *mdcache = in->mdcache;  // For the benefit of dout
 	auto ino = [this]() { return in->ino(); }; // For the benefit of dout
 	dout(20) << "validating a dirty CInode; results will be inconclusive"
 	  << dendl;
       }
-      if (in->is_symlink()) {
-	// there's nothing to do for symlinks!
-	return true;
-      }
-
-      // prefetch snaprealm's past parents
-      if (in->snaprealm && !in->snaprealm->have_past_parents_open())
-	in->snaprealm->open_parents(nullptr);
 
       C_OnFinisher *conf = new C_OnFinisher(get_io_callback(BACKTRACE),
 					    in->mdcache->mds->finisher);
@@ -4750,6 +4736,8 @@ next:
                            false);
         // Flag that we repaired this BT so that it won't go into damagetable
         results->backtrace.repaired = true;
+        if (in->mdcache->mds->logger)
+          in->mdcache->mds->logger->inc(l_mds_scrub_backtrace_repaired);
       }
 
       // If the inode's number was free in the InoTable, fix that
@@ -4771,6 +4759,8 @@ next:
               clog->error() << "inode table repaired for inode: " << in->ino();
 
               inotable->save();
+              if (in->mdcache->mds->logger)
+                in->mdcache->mds->logger->inc(l_mds_scrub_inotable_repaired);
             } else {
               clog->error() << "Cannot repair inotable while other operations"
                 " are in progress";
@@ -4781,10 +4771,14 @@ next:
 
 
       if (in->is_dir()) {
+        if (in->mdcache->mds->logger)
+          in->mdcache->mds->logger->inc(l_mds_scrub_dir_inodes);
 	return validate_directory_data();
       } else {
+        if (in->mdcache->mds->logger)
+          in->mdcache->mds->logger->inc(l_mds_scrub_file_inodes);
 	// TODO: validate on-disk inode for normal files
-	return check_inode_snaprealm();
+	return true;
       }
     }
 
@@ -4798,9 +4792,13 @@ next:
 	  in->mdcache->num_shadow_inodes++;
 	}
         shadow_in->fetch(get_internal_callback(INODE));
+        if (in->mdcache->mds->logger)
+          in->mdcache->mds->logger->inc(l_mds_scrub_dir_base_inodes);
         return false;
       } else {
 	// TODO: validate on-disk inode for non-base directories
+        if (in->mdcache->mds->logger)
+          in->mdcache->mds->logger->inc(l_mds_scrub_dirfrag_rstats);
 	results->inode.passed = true;
 	return check_dirfrag_rstats();
       }
@@ -4834,32 +4832,15 @@ next:
     }
 
     bool check_dirfrag_rstats() {
-      MDSGatherBuilder gather(g_ceph_context);
-      frag_vec_t leaves;
-      in->dirfragtree.get_leaves(leaves);
-      for (const auto& leaf : leaves) {
-        CDir *dir = in->get_or_open_dirfrag(in->mdcache, leaf);
-	dir->scrub_info();
-	if (!dir->scrub_infop->header)
-	  dir->scrub_infop->header = in->scrub_infop->header;
-        if (dir->is_complete()) {
-	  dir->scrub_local();
-	} else {
-	  dir->scrub_infop->need_scrub_local = true;
-	  dir->fetch(gather.new_sub(), false);
-	}
-      }
-      if (gather.has_subs()) {
-        gather.set_finisher(get_internal_callback(DIRFRAGS));
-        gather.activate();
-        return false;
+      if (in->has_subtree_root_dirfrag()) {
+	in->mdcache->rdlock_dirfrags_stats(in, get_internal_callback(DIRFRAGS));
+	return false;
       } else {
-        return immediate(DIRFRAGS, 0);
+	return immediate(DIRFRAGS, 0);
       }
     }
 
     bool _dirfrags(int rval) {
-      int frags_errors = 0;
       // basic reporting setup
       results->raw_stats.checked = true;
       results->raw_stats.ondisk_read_retval = rval;
@@ -4880,18 +4861,6 @@ next:
 	ceph_assert(dir->get_version() > 0);
 	nest_info.add(dir->get_fnode()->accounted_rstat);
 	dir_info.add(dir->get_fnode()->accounted_fragstat);
-	if (dir->scrub_infop->pending_scrub_error) {
-	  dir->scrub_infop->pending_scrub_error = false;
-	  if (dir->scrub_infop->header->get_repair()) {
-            results->raw_stats.repaired = true;
-	    results->raw_stats.error_str
-	      << "dirfrag(" << p.first << ") has bad stats (will be fixed); ";
-	  } else {
-	    results->raw_stats.error_str
-	      << "dirfrag(" << p.first << ") has bad stats; ";
-	  }
-	  frags_errors++;
-	}
       }
       nest_info.rsubdirs++; // it gets one to account for self
       if (const sr_t *srnode = in->get_projected_srnode(); srnode)
@@ -4911,42 +4880,9 @@ next:
 	}
 	goto next;
       }
-      if (frags_errors > 0)
-	goto next;
 
       results->raw_stats.passed = true;
 next:
-      // snaprealm
-      return check_inode_snaprealm();
-    }
-
-    bool check_inode_snaprealm() {
-      if (!in->snaprealm)
-	return true;
-
-      if (!in->snaprealm->have_past_parents_open()) {
-	in->snaprealm->open_parents(get_internal_callback(SNAPREALM));
-	return false;
-      } else {
-	return immediate(SNAPREALM, 0);
-      }
-    }
-
-    bool _snaprealm(int rval) {
-
-      if (in->snaprealm->past_parents_dirty ||
-	  !in->get_projected_srnode()->past_parents.empty()) {
-	// temporarily store error in field of on-disk inode validation temporarily
-	results->inode.checked = true;
-	results->inode.passed = false;
-	if (in->scrub_infop->header->get_repair()) {
-	  results->inode.error_str << "Inode has old format snaprealm (will upgrade)";
-	  results->inode.repaired = true;
-	  in->mdcache->upgrade_inode_snaprealm(in);
-	} else {
-	  results->inode.error_str << "Inode has old format snaprealm";
-	}
-      }
       return true;
     }
 
@@ -4964,6 +4900,8 @@ next:
 	in->scrub_infop->header->set_repaired();
       if (fin)
 	fin->complete(get_rval());
+
+      in->auth_unpin(this);
     }
   };
 
@@ -5173,11 +5111,11 @@ void CInode::scrub_info_create() const
   CInode *me = const_cast<CInode*>(this);
   const auto& pi = me->get_projected_inode();
 
-  scrub_info_t *si = new scrub_info_t();
-  si->scrub_start_stamp = si->last_scrub_stamp = pi->last_scrub_stamp;
-  si->scrub_start_version = si->last_scrub_version = pi->last_scrub_version;
+  std::unique_ptr<scrub_info_t> si(new scrub_info_t());
+  si->last_scrub_stamp = pi->last_scrub_stamp;
+  si->last_scrub_version = pi->last_scrub_version;
 
-  me->scrub_infop = si;
+  me->scrub_infop.swap(si);
 }
 
 void CInode::scrub_maybe_delete_info()
@@ -5185,171 +5123,40 @@ void CInode::scrub_maybe_delete_info()
   if (scrub_infop &&
       !scrub_infop->scrub_in_progress &&
       !scrub_infop->last_scrub_dirty) {
-    delete scrub_infop;
-    scrub_infop = NULL;
+    scrub_infop.reset();
   }
 }
 
-void CInode::scrub_initialize(CDentry *scrub_parent,
-			      ScrubHeaderRef& header,
-			      MDSContext *f)
+void CInode::scrub_initialize(ScrubHeaderRef& header)
 {
   dout(20) << __func__ << " with scrub_version " << get_version() << dendl;
-  if (scrub_is_in_progress()) {
-    dout(20) << __func__ << " inode moved during scrub, reinitializing "
-	     << dendl;
-    ceph_assert(scrub_infop->scrub_parent);
-    CDentry *dn = scrub_infop->scrub_parent;
-    CDir *dir = dn->dir;
-    dn->put(CDentry::PIN_SCRUBPARENT);
-    ceph_assert(dir->scrub_infop && dir->scrub_infop->directory_scrubbing);
-    dir->scrub_infop->directories_scrubbing.erase(dn->key());
-    dir->scrub_infop->others_scrubbing.erase(dn->key());
-  }
+
   scrub_info();
-  if (!scrub_infop)
-    scrub_infop = new scrub_info_t();
-
-  if (get_projected_inode()->is_dir()) {
-    // fill in dirfrag_stamps with initial state
-    frag_vec_t leaves;
-    dirfragtree.get_leaves(leaves);
-    for (const auto& leaf : leaves) {
-      if (header->get_force())
-	scrub_infop->dirfrag_stamps[leaf].reset();
-      else
-	scrub_infop->dirfrag_stamps[leaf];
-    }
-  }
-
-  if (scrub_parent)
-    scrub_parent->get(CDentry::PIN_SCRUBPARENT);
-  scrub_infop->scrub_parent = scrub_parent;
-  scrub_infop->on_finish = f;
   scrub_infop->scrub_in_progress = true;
-  scrub_infop->children_scrubbed = false;
+  scrub_infop->queued_frags.clear();
   scrub_infop->header = header;
-
-  scrub_infop->scrub_start_version = get_version();
-  scrub_infop->scrub_start_stamp = ceph_clock_now();
+  header->inc_num_pending();
   // right now we don't handle remote inodes
 }
 
-int CInode::scrub_dirfrag_next(frag_t* out_dirfrag)
-{
+void CInode::scrub_aborted() {
   dout(20) << __func__ << dendl;
   ceph_assert(scrub_is_in_progress());
 
-  if (!is_dir()) {
-    return -ENOTDIR;
-  }
-
-  std::map<frag_t, scrub_stamp_info_t>::iterator i =
-      scrub_infop->dirfrag_stamps.begin();
-
-  while (i != scrub_infop->dirfrag_stamps.end()) {
-    if (i->second.scrub_start_version < scrub_infop->scrub_start_version) {
-      i->second.scrub_start_version = get_projected_version();
-      i->second.scrub_start_stamp = ceph_clock_now();
-      *out_dirfrag = i->first;
-      dout(20) << " return frag " << *out_dirfrag << dendl;
-      return 0;
-    }
-    ++i;
-  }
-
-  dout(20) << " no frags left, ENOENT " << dendl;
-  return ENOENT;
+  scrub_infop->scrub_in_progress = false;
+  scrub_infop->header->dec_num_pending();
+  scrub_maybe_delete_info();
 }
 
-void CInode::scrub_dirfrags_scrubbing(frag_vec_t* out_dirfrags)
-{
-  ceph_assert(out_dirfrags != NULL);
-  ceph_assert(scrub_infop != NULL);
-
-  out_dirfrags->clear();
-  std::map<frag_t, scrub_stamp_info_t>::iterator i =
-      scrub_infop->dirfrag_stamps.begin();
-
-  while (i != scrub_infop->dirfrag_stamps.end()) {
-    if (i->second.scrub_start_version >= scrub_infop->scrub_start_version) {
-      if (i->second.last_scrub_version < scrub_infop->scrub_start_version)
-        out_dirfrags->push_back(i->first);
-    } else {
-      return;
-    }
-
-    ++i;
-  }
-}
-
-void CInode::scrub_dirfrag_finished(frag_t dirfrag)
-{
-  dout(20) << __func__ << " on frag " << dirfrag << dendl;
-  ceph_assert(scrub_is_in_progress());
-
-  std::map<frag_t, scrub_stamp_info_t>::iterator i =
-      scrub_infop->dirfrag_stamps.find(dirfrag);
-  ceph_assert(i != scrub_infop->dirfrag_stamps.end());
-
-  scrub_stamp_info_t &si = i->second;
-  si.last_scrub_stamp = si.scrub_start_stamp;
-  si.last_scrub_version = si.scrub_start_version;
-}
-
-void CInode::scrub_aborted(MDSContext **c) {
+void CInode::scrub_finished() {
   dout(20) << __func__ << dendl;
   ceph_assert(scrub_is_in_progress());
 
-  *c = nullptr;
-  std::swap(*c, scrub_infop->on_finish);
-
-  if (scrub_infop->scrub_parent) {
-    CDentry *dn = scrub_infop->scrub_parent;
-    scrub_infop->scrub_parent = NULL;
-    dn->dir->scrub_dentry_finished(dn);
-    dn->put(CDentry::PIN_SCRUBPARENT);
-  }
-
-  delete scrub_infop;
-  scrub_infop = nullptr;
-}
-
-void CInode::scrub_finished(MDSContext **c) {
-  dout(20) << __func__ << dendl;
-  ceph_assert(scrub_is_in_progress());
-  for (std::map<frag_t, scrub_stamp_info_t>::iterator i =
-      scrub_infop->dirfrag_stamps.begin();
-      i != scrub_infop->dirfrag_stamps.end();
-      ++i) {
-    if(i->second.last_scrub_version != i->second.scrub_start_version) {
-      derr << i->second.last_scrub_version << " != "
-        << i->second.scrub_start_version << dendl;
-    }
-    ceph_assert(i->second.last_scrub_version == i->second.scrub_start_version);
-  }
-
-  scrub_infop->last_scrub_version = scrub_infop->scrub_start_version;
-  scrub_infop->last_scrub_stamp = scrub_infop->scrub_start_stamp;
+  scrub_infop->last_scrub_version = get_version();
+  scrub_infop->last_scrub_stamp = ceph_clock_now();
   scrub_infop->last_scrub_dirty = true;
   scrub_infop->scrub_in_progress = false;
-
-  if (scrub_infop->scrub_parent) {
-    CDentry *dn = scrub_infop->scrub_parent;
-    scrub_infop->scrub_parent = NULL;
-    dn->dir->scrub_dentry_finished(dn);
-    dn->put(CDentry::PIN_SCRUBPARENT);
-  }
-
-  *c = scrub_infop->on_finish;
-  scrub_infop->on_finish = NULL;
-
-  if (scrub_infop->header->get_origin() == this) {
-    // We are at the point that a tagging scrub was initiated
-    LogChannelRef clog = mdcache->mds->clog;
-    clog->info() << "scrub complete with tag '"
-                 << scrub_infop->header->get_tag() << "'";
-  }
+  scrub_infop->header->dec_num_pending();
 }
 
 int64_t CInode::get_backtrace_pool() const
@@ -5364,16 +5171,35 @@ int64_t CInode::get_backtrace_pool() const
   }
 }
 
-void CInode::queue_export_pin(mds_rank_t target)
+void CInode::queue_export_pin(mds_rank_t export_pin)
 {
   if (state_test(CInode::STATE_QUEUEDEXPORTPIN))
     return;
 
+  mds_rank_t target;
+  if (export_pin >= 0)
+    target = export_pin;
+  else if (export_pin == MDS_RANK_EPHEMERAL_RAND)
+    target = mdcache->hash_into_rank_bucket(ino());
+  else
+    target = MDS_RANK_NONE;
+
+  unsigned min_frag_bits = mdcache->get_ephemeral_dist_frag_bits();
   bool queue = false;
   for (auto& p : dirfrags) {
     CDir *dir = p.second;
     if (!dir->is_auth())
       continue;
+
+    if (export_pin == MDS_RANK_EPHEMERAL_DIST) {
+      if (dir->get_frag().bits() < min_frag_bits) {
+	// needs split
+	queue = true;
+	break;
+      }
+      target = mdcache->hash_into_rank_bucket(ino(), dir->get_frag());
+    }
+
     if (target != MDS_RANK_NONE) {
       if (dir->is_subtree_root()) {
 	// set auxsubtree bit or export it
@@ -5388,11 +5214,13 @@ void CInode::queue_export_pin(mds_rank_t target)
       // clear aux subtrees ?
       queue = dir->state_test(CDir::STATE_AUXSUBTREE);
     }
-    if (queue) {
-      state_set(CInode::STATE_QUEUEDEXPORTPIN);
-      mdcache->export_pin_queue.insert(this);
+
+    if (queue)
       break;
-    }
+  }
+  if (queue) {
+    state_set(CInode::STATE_QUEUEDEXPORTPIN);
+    mdcache->export_pin_queue.insert(this);
   }
 }
 
@@ -5405,145 +5233,71 @@ void CInode::maybe_export_pin(bool update)
 
   dout(15) << __func__ << " update=" << update << " " << *this << dendl;
 
-  mds_rank_t export_pin = get_export_pin(false, false);
-  if (export_pin == MDS_RANK_NONE && !update) {
+  mds_rank_t export_pin = get_export_pin(false);
+  if (export_pin == MDS_RANK_NONE && !update)
     return;
-  }
 
-  /* disable ephemeral pins */
-  set_ephemeral_dist(false);
-  set_ephemeral_rand(false);
+  check_pin_policy(export_pin);
   queue_export_pin(export_pin);
 }
 
-void CInode::set_ephemeral_dist(bool yes)
+void CInode::set_ephemeral_pin(bool dist, bool rand)
 {
-  if (yes) {
-    if (!state_test(CInode::STATE_DISTEPHEMERALPIN)) {
-      state_set(CInode::STATE_DISTEPHEMERALPIN);
-      auto p = mdcache->dist_ephemeral_pins.insert(this);
+  unsigned state = 0;
+  if (dist)
+    state |= STATE_DISTEPHEMERALPIN;
+  if (rand)
+    state |= STATE_RANDEPHEMERALPIN;
+  if (!state)
+    return;
+
+  if (state_test(state) != state) {
+    dout(10) << "set ephemeral (" << (dist ? "dist" : "")
+	     << (rand ? " rand" : "") << ") pin on " << *this << dendl;
+    if (!is_ephemerally_pinned()) {
+      auto p = mdcache->export_ephemeral_pins.insert(this);
       ceph_assert(p.second);
     }
-  } else {
-    /* avoid std::set::erase if unnecessary */
-    if (state_test(CInode::STATE_DISTEPHEMERALPIN)) {
-      dout(10) << "clearing ephemeral distributed pin on " << *this << dendl;
-      state_clear(CInode::STATE_DISTEPHEMERALPIN);
-      auto count = mdcache->dist_ephemeral_pins.erase(this);
+    state_set(state);
+  }
+}
+
+void CInode::clear_ephemeral_pin(bool dist, bool rand)
+{
+  unsigned state = 0;
+  if (dist)
+    state |= STATE_DISTEPHEMERALPIN;
+  if (rand)
+    state |= STATE_RANDEPHEMERALPIN;
+
+  if (state_test(state)) {
+    dout(10) << "clear ephemeral (" << (dist ? "dist" : "")
+	     << (rand ? " rand" : "") << ") pin on " << *this << dendl;
+    state_clear(state);
+    if (!is_ephemerally_pinned()) {
+      auto count = mdcache->export_ephemeral_pins.erase(this);
       ceph_assert(count == 1);
-      queue_export_pin(MDS_RANK_NONE);
     }
   }
 }
 
-void CInode::maybe_ephemeral_dist(bool update)
-{
-  if (!mdcache->get_export_ephemeral_distributed_config()) {
-    dout(15) << __func__ << " config false: cannot ephemeral distributed pin " << *this << dendl;
-    set_ephemeral_dist(false);
-    return;
-  } else if (!is_dir() || !is_normal()) {
-    dout(15) << __func__ << " !dir or !normal: cannot ephemeral distributed pin " << *this << dendl;
-    set_ephemeral_dist(false);
-    return;
-  } else if (get_inode()->nlink == 0) {
-    dout(15) << __func__ << " unlinked directory: cannot ephemeral distributed pin " << *this << dendl;
-    set_ephemeral_dist(false);
-    return;
-  } else if (!update && state_test(CInode::STATE_DISTEPHEMERALPIN)) {
-    dout(15) << __func__ << " requeueing already pinned " << *this << dendl;
-    queue_export_pin(mdcache->hash_into_rank_bucket(ino()));
-    return;
-  }
-
-  dout(15) << __func__ << " update=" << update << " " << *this << dendl;
-
-  auto dir = get_parent_dir();
-  if (!dir) {
-    return;
-  }
-
-  bool pin = dir->get_inode()->get_inode()->export_ephemeral_distributed_pin;
-  if (pin) {
-    dout(10) << __func__ << "  ephemeral distributed pinning " << *this << dendl;
-    set_ephemeral_dist(true);
-    queue_export_pin(mdcache->hash_into_rank_bucket(ino()));
-  } else if (update) {
-    set_ephemeral_dist(false);
-    queue_export_pin(MDS_RANK_NONE);
-  }
-}
-
-void CInode::maybe_ephemeral_dist_children(bool update)
-{
-  if (!mdcache->get_export_ephemeral_distributed_config()) {
-    dout(15) << __func__ << " config false: cannot ephemeral distributed pin " << *this << dendl;
-    return;
-  } else if (!is_dir() || !is_normal()) {
-    dout(15) << __func__ << " !dir or !normal: cannot ephemeral distributed pin " << *this << dendl;
-    return;
-  } else if (get_inode()->nlink == 0) {
-    dout(15) << __func__ << " unlinked directory: cannot ephemeral distributed pin " << *this << dendl;
-    return;
-  }
-
-  bool pin = get_inode()->export_ephemeral_distributed_pin;
-  /* FIXME: expensive to iterate children when not updating */
-  if (!pin && !update) {
-    return;
-  }
-
-  dout(10) << __func__ << " maybe ephemerally pinning children of " << *this << dendl;
-  for (auto& p : dirfrags) {
-    auto& dir = p.second;
-    for (auto& q : *dir) {
-      auto& dn = q.second;
-      auto&& in = dn->get_linkage()->get_inode();
-      if (in && in->is_dir()) {
-        in->maybe_ephemeral_dist(update);
-      }
-    }
-  }
-}
-
-void CInode::set_ephemeral_rand(bool yes)
-{
-  if (yes) {
-    if (!state_test(CInode::STATE_RANDEPHEMERALPIN)) {
-      state_set(CInode::STATE_RANDEPHEMERALPIN);
-      auto p = mdcache->rand_ephemeral_pins.insert(this);
-      ceph_assert(p.second);
-    }
-  } else {
-    if (state_test(CInode::STATE_RANDEPHEMERALPIN)) {
-      dout(10) << "clearing ephemeral random pin on " << *this << dendl;
-      state_clear(CInode::STATE_RANDEPHEMERALPIN);
-      auto count = mdcache->rand_ephemeral_pins.erase(this);
-      ceph_assert(count == 1);
-      queue_export_pin(MDS_RANK_NONE);
-    }
-  }
-}
-
-void CInode::maybe_ephemeral_rand(bool fresh, double threshold)
+void CInode::maybe_ephemeral_rand(double threshold)
 {
   if (!mdcache->get_export_ephemeral_random_config()) {
     dout(15) << __func__ << " config false: cannot ephemeral random pin " << *this << dendl;
-    set_ephemeral_rand(false);
+    clear_ephemeral_pin(false, true);
     return;
   } else if (!is_dir() || !is_normal()) {
     dout(15) << __func__ << " !dir or !normal: cannot ephemeral random pin " << *this << dendl;
-    set_ephemeral_rand(false);
+    clear_ephemeral_pin(false, true);
     return;
   } else if (get_inode()->nlink == 0) {
     dout(15) << __func__ << " unlinked directory: cannot ephemeral random pin " << *this << dendl;
-    set_ephemeral_rand(false);
+    clear_ephemeral_pin(false, true);
     return;
   } else if (state_test(CInode::STATE_RANDEPHEMERALPIN)) {
     dout(10) << __func__ << " already ephemeral random pinned: requeueing " << *this << dendl;
-    queue_export_pin(mdcache->hash_into_rank_bucket(ino()));
-    return;
-  } else if (!fresh) {
+    queue_export_pin(MDS_RANK_EPHEMERAL_RAND);
     return;
   }
 
@@ -5561,8 +5315,8 @@ void CInode::maybe_ephemeral_rand(bool fresh, double threshold)
 
   if (n <= threshold) {
     dout(10) << __func__ << " randomly export pinning " << *this << dendl;
-    set_ephemeral_rand(true);
-    queue_export_pin(mdcache->hash_into_rank_bucket(ino()));
+    set_ephemeral_pin(false, true);
+    queue_export_pin(MDS_RANK_EPHEMERAL_RAND);
   }
 }
 
@@ -5585,43 +5339,19 @@ void CInode::set_export_pin(mds_rank_t rank)
   maybe_export_pin(true);
 }
 
-void CInode::check_pin_policy()
+mds_rank_t CInode::get_export_pin(bool inherit) const
 {
-  const CInode *in = this;
-  mds_rank_t etarget = MDS_RANK_NONE;
-  while (true) {
-    if (in->is_system())
-      break;
-    const CDentry *pdn = in->get_parent_dn();
-    if (!pdn)
-      break;
-    if (in->get_inode()->nlink == 0) {
-      // ignore export pin for unlinked directory
-      return;
-    } else if (etarget != MDS_RANK_NONE && in->has_ephemeral_policy()) {
-      return;
-    } else if (in->get_inode()->export_pin >= 0) {
-      /* clear any epin policy */
-      set_ephemeral_dist(false);
-      set_ephemeral_rand(false);
-      return;
-    } else if (etarget == MDS_RANK_NONE && in->is_ephemerally_pinned()) {
-      /* If a parent overrides a grandparent ephemeral pin policy with an export pin, we use that export pin instead. */
-      etarget = mdcache->hash_into_rank_bucket(in->ino());
-    }
-    in = pdn->get_dir()->inode;
-  }
-}
+  if (!g_conf()->mds_bal_export_pin)
+    return MDS_RANK_NONE;
 
-mds_rank_t CInode::get_export_pin(bool inherit, bool ephemeral) const
-{
   /* An inode that is export pinned may not necessarily be a subtree root, we
    * need to traverse the parents. A base or system inode cannot be pinned.
    * N.B. inodes not yet linked into a dir (i.e. anonymous inodes) will not
    * have a parent yet.
    */
+  mds_rank_t r_target = MDS_RANK_NONE;
   const CInode *in = this;
-  mds_rank_t etarget = MDS_RANK_NONE;
+  const CDir *dir = nullptr;
   while (true) {
     if (in->is_system())
       break;
@@ -5630,26 +5360,54 @@ mds_rank_t CInode::get_export_pin(bool inherit, bool ephemeral) const
       break;
     if (in->get_inode()->nlink == 0) {
       // ignore export pin for unlinked directory
-      return MDS_RANK_NONE;
-    } else if (etarget != MDS_RANK_NONE && in->has_ephemeral_policy()) {
-      return etarget;
-    } else if (in->get_inode()->export_pin >= 0) {
-      return in->get_inode()->export_pin;
-    } else if (etarget == MDS_RANK_NONE && ephemeral && in->is_ephemerally_pinned()) {
-      /* If a parent overrides a grandparent ephemeral pin policy with an export pin, we use that export pin instead. */
-      etarget = mdcache->hash_into_rank_bucket(in->ino());
-      if (!inherit) return etarget;
-    }
-
-    if (!inherit) {
       break;
     }
-    in = pdn->get_dir()->inode;
+
+    if (in->get_inode()->export_pin >= 0) {
+      return in->get_inode()->export_pin;
+    } else if (in->get_inode()->export_ephemeral_distributed_pin &&
+	       mdcache->get_export_ephemeral_distributed_config()) {
+      if (in != this)
+	return mdcache->hash_into_rank_bucket(in->ino(), dir->get_frag());
+      return MDS_RANK_EPHEMERAL_DIST;
+    } else if (r_target != MDS_RANK_NONE && in->get_inode()->export_ephemeral_random_pin > 0.0) {
+      return r_target;
+    } else if (r_target == MDS_RANK_NONE && in->is_ephemeral_rand() &&
+	       mdcache->get_export_ephemeral_random_config()) {
+      /* If a parent overrides a grandparent ephemeral pin policy with an export pin, we use that export pin instead. */
+      if (!inherit)
+	return MDS_RANK_EPHEMERAL_RAND;
+      if (in == this)
+	r_target = MDS_RANK_EPHEMERAL_RAND;
+      else
+	r_target = mdcache->hash_into_rank_bucket(in->ino());
+    }
+
+    if (!inherit)
+      break;
+    dir = pdn->get_dir();
+    in = dir->inode;
   }
   return MDS_RANK_NONE;
 }
 
-double CInode::get_ephemeral_rand(bool inherit) const
+void CInode::check_pin_policy(mds_rank_t export_pin)
+{
+  if (export_pin == MDS_RANK_EPHEMERAL_DIST) {
+    set_ephemeral_pin(true, false);
+    clear_ephemeral_pin(false, true);
+  } else if (export_pin == MDS_RANK_EPHEMERAL_RAND) {
+    set_ephemeral_pin(false, true);
+    clear_ephemeral_pin(true, false);
+  } else if (is_ephemerally_pinned()) {
+    // export_pin >= 0 || export_pin == MDS_RANK_NONE
+    clear_ephemeral_pin(true, true);
+    if (export_pin != get_inode()->export_pin) // inherited export_pin
+      queue_export_pin(MDS_RANK_NONE);
+  }
+}
+
+double CInode::get_ephemeral_rand() const
 {
   /* N.B. inodes not yet linked into a dir (i.e. anonymous inodes) will not
    * have a parent yet.
@@ -5672,26 +5430,13 @@ double CInode::get_ephemeral_rand(bool inherit) const
     /* An export_pin overrides only if no closer parent (incl. this one) has a
      * random pin set.
      */
-    if (in->get_inode()->export_pin >= 0)
+    if (in->get_inode()->export_pin >= 0 ||
+	in->get_inode()->export_ephemeral_distributed_pin)
       return 0.0;
 
-    if (!inherit)
-      break;
     in = pdn->get_dir()->inode;
   }
   return 0.0;
-}
-
-bool CInode::is_exportable(mds_rank_t dest) const
-{
-  mds_rank_t pin = get_export_pin();
-  if (pin == dest) {
-    return true;
-  } else if (pin >= 0) {
-    return false;
-  } else {
-    return true;
-  }
 }
 
 void CInode::get_nested_dirfrags(std::vector<CDir*>& v) const

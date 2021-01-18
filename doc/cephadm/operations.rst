@@ -278,19 +278,80 @@ You can disable this health warning with::
 /etc/ceph/ceph.conf
 ===================
 
-Cephadm uses a minimized ``ceph.conf`` that only contains 
+Cephadm distributes a minimized ``ceph.conf`` that only contains 
 a minimal set of information to connect to the Ceph cluster.
 
-To update the configuration settings, use::
+To update the configuration settings, instead of manually editing
+the ``ceph.conf`` file, use the config database instead::
 
   ceph config set ...
 
+See :ref:`ceph-conf-database` for details. 
 
-To set up an initial configuration before calling
-`bootstrap`, create an initial ``ceph.conf`` file. For example::
+By default, cephadm does not deploy that minimized ``ceph.conf`` across the
+cluster. To enable the management of ``/etc/ceph/ceph.conf`` files on all
+hosts, please enable this by running::
+
+  ceph config set mgr mgr/cephadm/manage_etc_ceph_ceph_conf true
+
+To set up an initial configuration before bootstrapping 
+the cluster, create an initial ``ceph.conf`` file. For example::
 
   cat <<EOF > /etc/ceph/ceph.conf
   [global]
   osd crush chooseleaf type = 0
   EOF
+
+Then, run bootstrap referencing this file::
+
   cephadm bootstrap -c /root/ceph.conf ...
+
+
+.. _cephadm-removing-hosts:
+
+Removing Hosts
+==============
+
+If the node that want you to remove is running OSDs, make sure you remove the OSDs from the node.
+
+To remove a host from a cluster, do the following:
+
+For all Ceph service types, except for ``node-exporter`` and ``crash``, remove
+the host from the placement specification file (for example, cluster.yml).
+For example, if you are removing the host named host2, remove all occurrences of
+``- host2`` from all ``placement:`` sections.
+
+Update:
+
+.. code-block:: yaml
+
+  service_type: rgw
+  placement:
+    hosts:
+    - host1
+    - host2
+
+To:
+
+.. code-block:: yaml
+
+
+  service_type: rgw
+  placement:
+    hosts:
+    - host1
+
+Remove the host from cephadm's environment:
+
+.. code-block:: bash
+
+  ceph orch host rm host2
+
+See also :ref:`orchestrator-cli-host-management`.
+
+If the host is running ``node-exporter`` and crash services, remove them by running
+the following command on the host:
+
+.. code-block:: bash
+
+  cephadm rm-daemon --fsid CLUSTER_ID --name SERVICE_NAME

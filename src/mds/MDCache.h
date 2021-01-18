@@ -193,9 +193,6 @@ class MDCache {
   explicit MDCache(MDSRank *m, PurgeQueue &purge_queue_);
   ~MDCache();
 
-  bool forward_all_reqs_to_auth() const { 
-    return forward_all_requests_to_auth;
-  }
   uint64_t cache_limit_memory(void) {
     return cache_memory_limit;
   }
@@ -215,6 +212,9 @@ class MDCache {
 
   void advance_stray();
 
+  unsigned get_ephemeral_dist_frag_bits() const {
+    return export_ephemeral_dist_frag_bits;
+  }
   bool get_export_ephemeral_distributed_config(void) const {
     return export_ephemeral_distributed_config;
   }
@@ -235,7 +235,7 @@ class MDCache {
     stray_manager.eval_stray(dn);
   }
 
-  mds_rank_t hash_into_rank_bucket(inodeno_t ino);
+  mds_rank_t hash_into_rank_bucket(inodeno_t ino, frag_t fg=0);
 
   void maybe_eval_stray(CInode *in, bool delay=false);
   void clear_dirty_bits_for_stray(CInode* diri);
@@ -834,7 +834,9 @@ class MDCache {
 
   void kick_open_ino_peers(mds_rank_t who);
   void open_ino(inodeno_t ino, int64_t pool, MDSContext *fin,
-		bool want_replica=true, bool want_xlocked=false);
+		bool want_replica=true, bool want_xlocked=false,
+		vector<inode_backpointer_t> *ancestors_hint=nullptr,
+		mds_rank_t auth_hint=MDS_RANK_NONE);
 
   void find_ino_peers(inodeno_t ino, MDSContext *c,
 		      mds_rank_t hint=MDS_RANK_NONE, bool path_locked=false);
@@ -938,7 +940,7 @@ class MDCache {
 		     Formatter *f, Context *fin);
   void repair_inode_stats(CInode *diri);
   void repair_dirfrag_stats(CDir *dir);
-  void upgrade_inode_snaprealm(CInode *in);
+  void rdlock_dirfrags_stats(CInode *diri, MDSInternalContext *fin);
 
   // my leader
   MDSRank *mds;
@@ -993,8 +995,7 @@ class MDCache {
   /* Because exports may fail, this set lets us keep track of inodes that need exporting. */
   std::set<CInode *> export_pin_queue;
   std::set<CInode *> export_pin_delayed_queue;
-  std::set<CInode *> rand_ephemeral_pins;
-  std::set<CInode *> dist_ephemeral_pins;
+  std::set<CInode *> export_ephemeral_pins;
 
   OpenFileTable open_file_table;
 
@@ -1123,10 +1124,9 @@ class MDCache {
    * long time)
    */
   void enqueue_scrub_work(MDRequestRef& mdr);
-  void recursive_scrub_finish(const ScrubHeaderRef& header);
   void repair_inode_stats_work(MDRequestRef& mdr);
   void repair_dirfrag_stats_work(MDRequestRef& mdr);
-  void upgrade_inode_snaprealm_work(MDRequestRef& mdr);
+  void rdlock_dirfrags_stats_work(MDRequestRef& mdr);
 
   ceph::unordered_map<inodeno_t,CInode*> inode_map;  // map of head inodes by ino
   map<vinodeno_t, CInode*> snap_inode_map;  // map of snap inodes by ino
@@ -1308,11 +1308,11 @@ class MDCache {
   uint64_t cache_memory_limit;
   double cache_reservation;
   double cache_health_threshold;
-  bool forward_all_requests_to_auth;
   std::array<CInode *, NUM_STRAY> strays{}; // my stray dir
 
   bool export_ephemeral_distributed_config;
   bool export_ephemeral_random_config;
+  unsigned export_ephemeral_dist_frag_bits;
 
   // File size recovery
   RecoveryQueue recovery_queue;
@@ -1345,8 +1345,20 @@ class C_MDS_RetryRequest : public MDSInternalContext {
   MDCache *cache;
   MDRequestRef mdr;
  public:
-  C_MDS_RetryRequest(MDCache *c, MDRequestRef& r);
+  C_MDS_RetryRequest(MDCache *c, MDRequestRef& r) :
+    MDSInternalContext(c->mds), cache(c), mdr(r) {}
   void finish(int r) override;
+};
+
+class CF_MDS_RetryRequestFactory : public MDSContextFactory {
+public:
+  CF_MDS_RetryRequestFactory(MDCache *cache, MDRequestRef &mdr, bool dl) :
+    mdcache(cache), mdr(mdr), drop_locks(dl) {}
+  MDSContext *build() override;
+private:
+  MDCache *mdcache;
+  MDRequestRef mdr;
+  bool drop_locks;
 };
 
 #endif

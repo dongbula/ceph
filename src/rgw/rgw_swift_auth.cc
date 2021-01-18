@@ -19,6 +19,7 @@
 
 #include "rgw_client_io.h"
 #include "rgw_http_client.h"
+#include "rgw_sal_rados.h"
 #include "include/str_list.h"
 
 #define dout_context g_ceph_context
@@ -67,7 +68,7 @@ bool TempURLEngine::is_applicable(const req_state* const s) const noexcept
 }
 
 void TempURLEngine::get_owner_info(const DoutPrefixProvider* dpp, const req_state* const s,
-                                   RGWUserInfo& owner_info) const
+                                   RGWUserInfo& owner_info, optional_yield y) const
 {
   /* We cannot use req_state::bucket_name because it isn't available
    * now. It will be initialized in RGWHandler_REST_SWIFT::postauth_init(). */
@@ -112,8 +113,7 @@ void TempURLEngine::get_owner_info(const DoutPrefixProvider* dpp, const req_stat
   /* Need to get user info of bucket owner. */
   RGWBucketInfo bucket_info;
   RGWSI_MetaBackend_CtxParams bectx_params = RGWSI_MetaBackend_CtxParams_SObj(s->sysobj_ctx);
-  int ret = ctl->bucket->read_bucket_info(b, &bucket_info, null_yield, RGWBucketCtl::BucketInstance::GetParams()
-                                                                       .set_bectx_params(bectx_params));
+  int ret = ctl->bucket->read_bucket_info(b, &bucket_info, y, RGWBucketCtl::BucketInstance::GetParams().set_bectx_params(bectx_params));
   if (ret < 0) {
     throw ret;
   }
@@ -275,7 +275,7 @@ public:
 }; /* TempURLEngine::PrefixableSignatureHelper */
 
 TempURLEngine::result_t
-TempURLEngine::authenticate(const DoutPrefixProvider* dpp, const req_state* const s) const
+TempURLEngine::authenticate(const DoutPrefixProvider* dpp, const req_state* const s, optional_yield y) const
 {
   if (! is_applicable(s)) {
     return result_t::deny();
@@ -300,7 +300,7 @@ TempURLEngine::authenticate(const DoutPrefixProvider* dpp, const req_state* cons
 
   RGWUserInfo owner_info;
   try {
-    get_owner_info(dpp, s, owner_info);
+    get_owner_info(dpp, s, owner_info, y);
   } catch (...) {
     ldpp_dout(dpp, 5) << "cannot get user_info of account's owner" << dendl;
     return result_t::reject();
@@ -402,7 +402,7 @@ bool ExternalTokenEngine::is_applicable(const std::string& token) const noexcept
 ExternalTokenEngine::result_t
 ExternalTokenEngine::authenticate(const DoutPrefixProvider* dpp,
                                   const std::string& token,
-                                  const req_state* const s) const
+                                  const req_state* const s, optional_yield y) const
 {
   if (! is_applicable(token)) {
     return result_t::deny();
@@ -421,7 +421,7 @@ ExternalTokenEngine::authenticate(const DoutPrefixProvider* dpp,
 
   ldpp_dout(dpp, 10) << "rgw_swift_validate_token url=" << url_buf << dendl;
 
-  int ret = validator.process(null_yield);
+  int ret = validator.process(y);
   if (ret < 0) {
     throw ret;
   }
@@ -620,7 +620,7 @@ SignedTokenEngine::authenticate(const DoutPrefixProvider* dpp,
 } /* namespace rgw */
 
 
-void RGW_SWIFT_Auth_Get::execute()
+void RGW_SWIFT_Auth_Get::execute(optional_yield y)
 {
   int ret = -EPERM;
 
@@ -751,7 +751,7 @@ int RGWHandler_SWIFT_Auth::init(rgw::sal::RGWRadosStore *store, struct req_state
   return RGWHandler::init(store, state, cio);
 }
 
-int RGWHandler_SWIFT_Auth::authorize(const DoutPrefixProvider *dpp)
+int RGWHandler_SWIFT_Auth::authorize(const DoutPrefixProvider *dpp, optional_yield)
 {
   return 0;
 }

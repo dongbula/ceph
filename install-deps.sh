@@ -26,6 +26,8 @@ ARCH=$(uname -m)
 function munge_ceph_spec_in {
     local with_seastar=$1
     shift
+    local with_zbd=$1
+    shift
     local for_make_check=$1
     shift
     local OUTFILE=$1
@@ -33,6 +35,12 @@ function munge_ceph_spec_in {
     # http://rpm.org/user_doc/conditional_builds.html
     if $with_seastar; then
         sed -i -e 's/%bcond_with seastar/%bcond_without seastar/g' $OUTFILE
+    fi
+    if $with_jaeger; then
+        sed -i -e 's/%bcond_with jaeger/%bcond_without jaeger/g' $OUTFILE
+    fi
+    if $with_zbd; then
+        sed -i -e 's/%bcond_with zbd/%bcond_without zbd/g' $OUTFILE
     fi
     if $for_make_check; then
         sed -i -e 's/%bcond_with make_check/%bcond_without make_check/g' $OUTFILE
@@ -56,6 +64,10 @@ function munge_debian_control {
     if $with_seastar; then
 	sed -i -e 's/^# Crimson[[:space:]]//g' $control
     fi
+    if $with_jaeger; then
+	sed -i -e 's/^# Jaeger[[:space:]]//g' $control
+	sed -i -e 's/^# Crimson      libyaml-cpp-dev,/d' $control
+    fi
     if $for_make_check; then
         sed -i 's/^# Make-Check[[:space:]]/             /g' $control
     fi
@@ -76,7 +88,6 @@ function ensure_decent_gcc_on_ubuntu {
 	$SUDO tee /etc/apt/sources.list.d/ubuntu-toolchain-r.list <<EOF
 deb [lang=none] http://ppa.launchpad.net/ubuntu-toolchain-r/test/ubuntu $codename main
 deb [arch=amd64 lang=none] http://mirror.nullivex.com/ppa/ubuntu-toolchain-r-test $codename main
-deb [arch=amd64 lang=none] http://deb.rug.nl/ppa/mirror/ppa.launchpad.net/ubuntu-toolchain-r/test/ubuntu $codename main
 EOF
 	# import PPA's signing key into APT's keyring
 	cat << ENDOFKEY | $SUDO apt-key add -
@@ -216,7 +227,7 @@ if [ x$(uname)x = xFreeBSDx ]; then
         devel/gperf \
         devel/gmake \
         devel/cmake \
-        devel/yasm \
+        devel/nasm \
         devel/boost-all \
         devel/boost-python-libs \
         devel/valgrind \
@@ -267,6 +278,8 @@ if [ x$(uname)x = xFreeBSDx ]; then
     exit
 else
     [ $WITH_SEASTAR ] && with_seastar=true || with_seastar=false
+    [ $WITH_JAEGER ] && with_jaeger=true || with_jaeger=false
+    [ $WITH_ZBD ] && with_zbd=true || with_zbd=false
     source /etc/os-release
     case "$ID" in
     debian|ubuntu|devuan|elementary)
@@ -278,9 +291,6 @@ else
             *Bionic*)
                 ensure_decent_gcc_on_ubuntu 9 bionic
                 [ ! $NO_BOOST_PKGS ] && install_boost_on_ubuntu bionic
-                ;;
-            *Disco*)
-                [ ! $NO_BOOST_PKGS ] && apt-get install -y libboost1.67-all-dev
                 ;;
             *)
                 $SUDO apt-get install -y gcc
@@ -322,7 +332,8 @@ else
                 $SUDO rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-$MAJOR_VERSION
                 $SUDO rm -f /etc/yum.repos.d/dl.fedoraproject.org*
 		if test $ID = centos -a $MAJOR_VERSION = 8 ; then
-                    $SUDO dnf config-manager --set-enabled PowerTools
+                    # Enable 'powertools' or 'PowerTools' repo
+                    $SUDO dnf config-manager --set-enabled $(dnf repolist --all 2>/dev/null|gawk 'tolower($0) ~ /^powertools\s/{print $1}')
 		    # before EPEL8 and PowerTools provide all dependencies, we use sepia for the dependencies
                     $SUDO dnf config-manager --add-repo http://apt-mirror.front.sepia.ceph.com/lab-extras/8/
                     $SUDO dnf config-manager --setopt=apt-mirror.front.sepia.ceph.com_lab-extras_8_.gpgcheck=0 --save
@@ -333,7 +344,7 @@ else
                 fi
                 ;;
         esac
-        munge_ceph_spec_in $with_seastar $for_make_check $DIR/ceph.spec
+        munge_ceph_spec_in $with_seastar $with_zbd $for_make_check $DIR/ceph.spec
         # for python3_pkgversion macro defined by python-srpm-macros, which is required by python3-devel
         $SUDO dnf install -y python3-devel
         $SUDO $builddepcmd $DIR/ceph.spec 2>&1 | tee $DIR/yum-builddep.out
@@ -345,20 +356,8 @@ else
         echo "Using zypper to install dependencies"
         zypp_install="zypper --gpg-auto-import-keys --non-interactive install --no-recommends"
         $SUDO $zypp_install systemd-rpm-macros rpm-build || exit 1
-        munge_ceph_spec_in $with_seastar $for_make_check $DIR/ceph.spec
+        munge_ceph_spec_in $with_seastar false $for_make_check $DIR/ceph.spec
         $SUDO $zypp_install $(rpmspec -q --buildrequires $DIR/ceph.spec) || exit 1
-        ;;
-    alpine)
-        # for now we need the testing repo for leveldb
-        TESTREPO="http://nl.alpinelinux.org/alpine/edge/testing"
-        if ! grep -qF "$TESTREPO" /etc/apk/repositories ; then
-            $SUDO echo "$TESTREPO" | sudo tee -a /etc/apk/repositories > /dev/null
-        fi
-        source alpine/APKBUILD.in
-        $SUDO apk --update add abuild build-base ccache $makedepends
-        if id -u build >/dev/null 2>&1 ; then
-           $SUDO addgroup build abuild
-        fi
         ;;
     *)
         echo "$ID is unknown, dependencies will have to be installed manually."

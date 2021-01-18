@@ -71,6 +71,20 @@ Basic
 :command:`mount_timeout`
     int (seconds), Default: 60
 
+:command:`ms_mode=<legacy|crc|secure|prefer-crc|prefer-secure>`
+    Set the connection mode that the client uses for transport. The available
+    modes are:
+
+    - ``legacy``: use messenger v1 protocol to talk to the cluster
+
+    - ``crc``: use messenger v2, without on-the-wire encryption
+
+    - ``secure``: use messenger v2, with on-the-wire encryption
+
+    - ``prefer-crc``: crc mode, if denied agree to secure mode
+
+    - ``prefer-secure``: secure mode, if denied agree to crc mode
+
 :command:`name`
     RADOS user to authenticate as when using CephX. Default: guest
 
@@ -82,15 +96,15 @@ Basic
     path to file containing the secret key to use with CephX
 
 :command:`recover_session=<no|clean>`
-    Set auto reconnect mode in the case where the client is blacklisted. The
+    Set auto reconnect mode in the case where the client is blocklisted. The
     available modes are ``no`` and ``clean``. The default is ``no``.
 
     - ``no``: never attempt to reconnect when client detects that it has been
-       blacklisted. Blacklisted clients will not attempt to reconnect and
+       blocklisted. Blocklisted clients will not attempt to reconnect and
        their operations will fail too.
 
     - ``clean``: client reconnects to the Ceph cluster automatically when it
-      detects that it has been blacklisted. During reconnect, client drops
+      detects that it has been blocklisted. During reconnect, client drops
       dirty data/metadata, invalidates page caches and writable file handles.
       After reconnect, file locks become stale because the MDS loses track of
       them. If an inode contains any stale file locks, read/write on the inode

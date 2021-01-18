@@ -5,6 +5,7 @@ describe('Iscsi Page', () => {
 
   beforeEach(() => {
     cy.login();
+    Cypress.Cookies.preserveOnce('token');
     iscsi.navigateTo();
   });
 
@@ -15,7 +16,7 @@ describe('Iscsi Page', () => {
   it('should check that tables are displayed and legends are correct', () => {
     // Check tables are displayed
     iscsi.getDataTables().its(0).should('be.visible');
-    iscsi.getDataTables().its(1).should('visible');
+    iscsi.getDataTables().its(1).should('be.visible');
 
     // Check that legends are correct
     iscsi.getLegends().its(0).should('contain.text', 'Gateways');

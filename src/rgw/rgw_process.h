@@ -5,7 +5,6 @@
 #define RGW_PROCESS_H
 
 #include "rgw_common.h"
-#include "rgw_rados.h"
 #include "rgw_acl.h"
 #include "rgw_auth_registry.h"
 #include "rgw_user.h"
@@ -42,6 +41,7 @@ struct RGWProcessEnv {
 };
 
 class RGWFrontendConfig;
+class RGWRequest;
 
 class RGWProcess {
   deque<RGWRequest*> m_req_queue;
@@ -185,12 +185,14 @@ extern int process_request(rgw::sal::RGWRadosStore* store,
                            OpsLogSocket* olog,
                            optional_yield y,
                            rgw::dmclock::Scheduler *scheduler,
+                           std::string* user,
                            int* http_ret = nullptr);
 
 extern int rgw_process_authenticated(RGWHandler_REST* handler,
                                      RGWOp*& op,
                                      RGWRequest* req,
                                      req_state* s,
+				     optional_yield y,
                                      bool skip_retarget = false);
 
 #if defined(def_dout_subsys)

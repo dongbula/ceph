@@ -1,17 +1,18 @@
-import { Component, Input, OnChanges, OnInit, SimpleChanges } from '@angular/core';
+import { Component, Input, OnChanges, OnInit, SimpleChanges, ViewChild } from '@angular/core';
 
-import * as _ from 'lodash';
+import { NgbNav } from '@ng-bootstrap/ng-bootstrap';
+import _ from 'lodash';
 
-import { HostService } from '../../../shared/api/host.service';
-import { OsdService } from '../../../shared/api/osd.service';
-import { CdTableColumn } from '../../../shared/models/cd-table-column';
+import { HostService } from '~/app/shared/api/host.service';
+import { OsdService } from '~/app/shared/api/osd.service';
+import { CdTableColumn } from '~/app/shared/models/cd-table-column';
 import {
   HddSmartDataV1,
   NvmeSmartDataV1,
   SmartDataResult,
   SmartError,
   SmartErrorResult
-} from '../../../shared/models/smart';
+} from '~/app/shared/models/smart';
 
 @Component({
   selector: 'cd-smart-list',
@@ -19,6 +20,9 @@ import {
   styleUrls: ['./smart-list.component.scss']
 })
 export class SmartListComponent implements OnInit, OnChanges {
+  @ViewChild('innerNav')
+  nav: NgbNav;
+
   @Input()
   osdId: number = null;
   @Input()
@@ -31,6 +35,8 @@ export class SmartListComponent implements OnInit, OnChanges {
   data: { [deviceId: string]: SmartDataResult | SmartErrorResult } = {};
 
   smartDataColumns: CdTableColumn[];
+
+  isEmpty = _.isEmpty;
 
   constructor(private osdService: OsdService, private hostService: HostService) {}
 

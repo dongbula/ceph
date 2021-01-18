@@ -1,10 +1,12 @@
 import { Component, OnInit } from '@angular/core';
-import { Router } from '@angular/router';
+import { ActivatedRoute, Router } from '@angular/router';
 
-import { AuthService } from '../../../shared/api/auth.service';
-import { Credentials } from '../../../shared/models/credentials';
-import { AuthStorageService } from '../../../shared/services/auth-storage.service';
-import { ModalService } from '../../../shared/services/modal.service';
+import _ from 'lodash';
+
+import { AuthService } from '~/app/shared/api/auth.service';
+import { Credentials } from '~/app/shared/models/credentials';
+import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
+import { ModalService } from '~/app/shared/services/modal.service';
 
 @Component({
   selector: 'cd-login',
@@ -14,11 +16,13 @@ import { ModalService } from '../../../shared/services/modal.service';
 export class LoginComponent implements OnInit {
   model = new Credentials();
   isLoginActive = false;
+  returnUrl: string;
 
   constructor(
     private authService: AuthService,
     private authStorageService: AuthStorageService,
     private modalService: ModalService,
+    private route: ActivatedRoute,
     private router: Router
   ) {}
 
@@ -47,7 +51,6 @@ export class LoginComponent implements OnInit {
         } else {
           this.authStorageService.set(
             login.username,
-            token,
             login.permissions,
             login.sso,
             login.pwdExpirationDate
@@ -60,7 +63,8 @@ export class LoginComponent implements OnInit {
 
   login() {
     this.authService.login(this.model).subscribe(() => {
-      this.router.navigate(['']);
+      const url = _.get(this.route.snapshot.queryParams, 'returnUrl', '/');
+      this.router.navigate([url]);
     });
   }
 }

@@ -16,6 +16,7 @@
 #include <seastar/core/thread.hh>
 
 #include "crimson/osd/exceptions.h"
+#include "crimson/osd/pg.h"
 #include "crimson/osd/watch.h"
 #include "osd/ClassHandler.h"
 
@@ -435,17 +436,7 @@ OpsExecuter::execute_op(OSDOp& osd_op)
     [[fallthrough]];
   case CEPH_OSD_OP_READ:
     return do_read_op([&osd_op] (auto& backend, const auto& os) {
-      return backend.read(os.oi,
-                          osd_op.op.extent.offset,
-                          osd_op.op.extent.length,
-                          osd_op.op.extent.truncate_size,
-                          osd_op.op.extent.truncate_seq,
-                          osd_op.op.flags).safe_then(
-        [&osd_op](ceph::bufferlist&& bl) {
-          osd_op.rval = bl.length();
-          osd_op.outdata = std::move(bl);
-          return osd_op_errorator::now();
-        });
+      return backend.read(os, osd_op);
     });
   case CEPH_OSD_OP_SPARSE_READ:
     return do_read_op([&osd_op] (auto& backend, const auto& os) {
@@ -455,6 +446,10 @@ OpsExecuter::execute_op(OSDOp& osd_op)
     return do_read_op([&osd_op] (auto& backend, const auto& os) {
       return backend.checksum(os, osd_op);
     });
+  case CEPH_OSD_OP_CMPEXT:
+    return do_read_op([&osd_op] (auto& backend, const auto& os) {
+      return backend.cmp_ext(os, osd_op);
+    });
   case CEPH_OSD_OP_GETXATTR:
     return do_read_op([&osd_op] (auto& backend, const auto& os) {
       return backend.getxattr(os, osd_op);
@@ -463,6 +458,10 @@ OpsExecuter::execute_op(OSDOp& osd_op)
     return do_read_op([&osd_op] (auto& backend, const auto& os) {
       return backend.get_xattrs(os, osd_op);
     });
+  case CEPH_OSD_OP_RMXATTR:
+    return do_write_op([&osd_op] (auto& backend, auto& os, auto& txn) {
+      return backend.rm_xattr(os, osd_op, txn);
+    }, true);
   case CEPH_OSD_OP_CREATE:
     return do_write_op([&osd_op] (auto& backend, auto& os, auto& txn) {
       return backend.create(os, osd_op, txn);
@@ -471,9 +470,17 @@ OpsExecuter::execute_op(OSDOp& osd_op)
     return do_write_op([this, &osd_op] (auto& backend, auto& os, auto& txn) {
       return backend.write(os, osd_op, txn, *osd_op_params);
     }, true);
+  case CEPH_OSD_OP_WRITESAME:
+    return do_write_op([this, &osd_op] (auto& backend, auto& os, auto& txn) {
+      return backend.write_same(os, osd_op, txn, *osd_op_params);
+    }, true);
   case CEPH_OSD_OP_WRITEFULL:
     return do_write_op([this, &osd_op] (auto& backend, auto& os, auto& txn) {
       return backend.writefull(os, osd_op, txn, *osd_op_params);
+    }, true);
+  case CEPH_OSD_OP_APPEND:
+    return do_write_op([this, &osd_op] (auto& backend, auto& os, auto& txn) {
+      return backend.append(os, osd_op, txn, *osd_op_params);
     }, true);
   case CEPH_OSD_OP_TRUNCATE:
     return do_write_op([this, &osd_op] (auto& backend, auto& os, auto& txn) {
@@ -551,6 +558,10 @@ OpsExecuter::execute_op(OSDOp& osd_op)
 #endif
     return do_write_op([&osd_op] (auto& backend, auto& os, auto& txn) {
       return backend.omap_remove_range(os, osd_op, txn);
+    }, true);
+  case CEPH_OSD_OP_OMAPCLEAR:
+    return do_write_op([this, &osd_op] (auto& backend, auto& os, auto& txn) {
+      return backend.omap_clear(os, osd_op, txn, *osd_op_params);
     }, true);
 
   // watch/notify

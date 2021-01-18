@@ -238,6 +238,7 @@ peer_add()
     local cluster=$1 ; shift
     local pool=$1 ; shift
     local client_cluster=$1 ; shift
+    local remote_cluster="${client_cluster##*@}"
 
     local uuid_var_name
     if [ -n "$1" ]; then
@@ -257,7 +258,10 @@ peer_add()
         if [ $error_code -eq 17 ]; then
             # raced with a remote heartbeat ping -- remove and retry
             sleep $s
-            rbd --cluster ${cluster} --pool ${pool} mirror pool peer remove ${peer_uuid}
+            peer_uuid=$(rbd mirror pool info --cluster ${cluster} --pool ${pool} --format xml | \
+                xmlstarlet sel -t -v "//peers/peer[site_name='${remote_cluster}']/uuid")
+
+            CEPH_ARGS='' rbd --cluster ${cluster} --pool ${pool} mirror pool peer remove ${peer_uuid}
         else
             test $error_code -eq 0
             if [ -n "$uuid_var_name" ]; then

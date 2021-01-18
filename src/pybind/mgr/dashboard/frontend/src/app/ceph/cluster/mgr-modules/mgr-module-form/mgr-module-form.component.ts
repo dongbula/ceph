@@ -2,16 +2,17 @@ import { Component, OnInit } from '@angular/core';
 import { ValidatorFn, Validators } from '@angular/forms';
 import { ActivatedRoute, Router } from '@angular/router';
 
-import * as _ from 'lodash';
+import _ from 'lodash';
 import { forkJoin as observableForkJoin } from 'rxjs';
 
-import { MgrModuleService } from '../../../../shared/api/mgr-module.service';
-import { NotificationType } from '../../../../shared/enum/notification-type.enum';
-import { CdForm } from '../../../../shared/forms/cd-form';
-import { CdFormBuilder } from '../../../../shared/forms/cd-form-builder';
-import { CdFormGroup } from '../../../../shared/forms/cd-form-group';
-import { CdValidators } from '../../../../shared/forms/cd-validators';
-import { NotificationService } from '../../../../shared/services/notification.service';
+import { MgrModuleService } from '~/app/shared/api/mgr-module.service';
+import { ActionLabelsI18n } from '~/app/shared/constants/app.constants';
+import { NotificationType } from '~/app/shared/enum/notification-type.enum';
+import { CdForm } from '~/app/shared/forms/cd-form';
+import { CdFormBuilder } from '~/app/shared/forms/cd-form-builder';
+import { CdFormGroup } from '~/app/shared/forms/cd-form-group';
+import { CdValidators } from '~/app/shared/forms/cd-validators';
+import { NotificationService } from '~/app/shared/services/notification.service';
 
 @Component({
   selector: 'cd-mgr-module-form',
@@ -24,6 +25,7 @@ export class MgrModuleFormComponent extends CdForm implements OnInit {
   moduleOptions: any[] = [];
 
   constructor(
+    public actionLabels: ActionLabelsI18n,
     private route: ActivatedRoute,
     private router: Router,
     private formBuilder: CdFormBuilder,

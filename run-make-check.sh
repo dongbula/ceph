@@ -20,6 +20,8 @@
 
 source src/script/run-make.sh
 
+set -e
+
 function run() {
     # to prevent OSD EMFILE death on tests, make sure ulimit >= 1024
     $DRY_RUN ulimit -n $(ulimit -Hn)
@@ -58,8 +60,12 @@ function main() {
     if [ $WITH_SEASTAR ]; then
         cmake_opts+=" -DWITH_SEASTAR=ON"
     fi
+    if [ $WITH_ZBD ]; then
+        cmake_opts+=" -DWITH_ZBD=ON"
+    fi
     configure $cmake_opts $@
-    build tests && echo "make check: successful build on $(git rev-parse HEAD)"
+    build tests
+    echo "make check: successful build on $(git rev-parse HEAD)"
     run
 }
 

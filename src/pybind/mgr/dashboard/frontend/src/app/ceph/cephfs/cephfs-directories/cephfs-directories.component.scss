@@ -1,17 +1,17 @@
-@use './src/styles/defaults/bootstrap-defaults' as bd;
+@use './src/styles/vendor/variables' as vv;
 
 // Angular2-Tree Component
-::ng-deep tree-root {
+::ng-deep cd-cephfs-directories tree-root {
   .tree-children {
     overflow: inherit;
   }
 }
 
 .quota-origin {
-  color: bd.$color-brand-teal;
+  color: vv.$primary;
   cursor: pointer;
 
   &:hover {
-    color: bd.$color-gray13;
+    color: vv.$gray-900;
   }
 }

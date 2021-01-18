@@ -3,11 +3,12 @@ import fnmatch
 import re
 from collections import namedtuple, OrderedDict
 from functools import wraps
-from typing import Optional, Dict, Any, List, Union, Callable, Iterator
+from typing import Optional, Dict, Any, List, Union, Callable, Iterable
 
 import yaml
 
 from ceph.deployment.hostspec import HostSpec
+from ceph.deployment.utils import unwrap_ipv6
 
 
 class ServiceSpecValidationError(Exception):
@@ -58,14 +59,12 @@ class HostPlacementSpec(namedtuple('HostPlacementSpec', ['hostname', 'network', 
     @classmethod
     @handle_type_error
     def from_json(cls, data):
+        if isinstance(data, str):
+            return cls.parse(data)
         return cls(**data)
 
-    def to_json(self):
-        return {
-            'hostname': self.hostname,
-            'network': self.network,
-            'name': self.name
-        }
+    def to_json(self) -> str:
+        return str(self)
 
     @classmethod
     def parse(cls, host, require_network=True):
@@ -121,13 +120,16 @@ class HostPlacementSpec(namedtuple('HostPlacementSpec', ['hostname', 'network', 
         for network in networks:
             # only if we have versioned network configs
             if network.startswith('v') or network.startswith('[v'):
-                network = network.split(':')[1]
+                # if this is ipv6 we can't just simply split on ':' so do
+                # a split once and rsplit once to leave us with just ipv6 addr
+                network = network.split(':', 1)[1]
+                network = network.rsplit(':', 1)[0]
             try:
                 # if subnets are defined, also verify the validity
                 if '/' in network:
                     ip_network(network)
                 else:
-                    ip_address(network)
+                    ip_address(unwrap_ipv6(network))
             except ValueError as e:
                 # logging?
                 raise e
@@ -186,10 +188,11 @@ class PlacementSpec(object):
             self.hosts = [HostPlacementSpec.parse(x, require_network=False)  # type: ignore
                           for x in hosts if x]
 
+    # deprecated
     def filter_matching_hosts(self, _get_hosts_func: Callable) -> List[str]:
         return self.filter_matching_hostspecs(_get_hosts_func(as_hostspec=True))
 
-    def filter_matching_hostspecs(self, hostspecs: Iterator[HostSpec]) -> List[str]:
+    def filter_matching_hostspecs(self, hostspecs: Iterable[HostSpec]) -> List[str]:
         if self.hosts:
             all_hosts = [hs.hostname for hs in hostspecs]
             return [h.hostname for h in self.hosts if h.hostname in all_hosts]
@@ -203,22 +206,27 @@ class PlacementSpec(object):
             # get_host_selection_size
             return []
 
-    def get_host_selection_size(self, hostspecs: Iterator[HostSpec]):
+    def get_host_selection_size(self, hostspecs: Iterable[HostSpec]):
         if self.count:
             return self.count
         return len(self.filter_matching_hostspecs(hostspecs))
 
     def pretty_str(self):
+        """
+        >>> #doctest: +SKIP
+        ... ps = PlacementSpec(...)  # For all placement specs:
+        ... PlacementSpec.from_string(ps.pretty_str()) == ps
+        """
         kv = []
+        if self.hosts:
+            kv.append(';'.join([str(h) for h in self.hosts]))
         if self.count:
             kv.append('count:%d' % self.count)
         if self.label:
             kv.append('label:%s' % self.label)
-        if self.hosts:
-            kv.append('%s' % ','.join([str(h) for h in self.hosts]))
         if self.host_pattern:
             kv.append(self.host_pattern)
-        return ' '.join(kv)
+        return ';'.join(kv)
 
     def __repr__(self):
         kv = []
@@ -240,9 +248,7 @@ class PlacementSpec(object):
         if hosts:
             c['hosts'] = []
             for host in hosts:
-                c['hosts'].append(HostPlacementSpec.parse(host) if
-                                  isinstance(host, str) else
-                                  HostPlacementSpec.from_json(host))
+                c['hosts'].append(HostPlacementSpec.from_json(host))
         _cls = cls(**c)
         _cls.validate()
         return _cls
@@ -374,8 +380,9 @@ class ServiceSpec(object):
 
     """
     KNOWN_SERVICE_TYPES = 'alertmanager crash grafana iscsi mds mgr mon nfs ' \
-                          'node-exporter osd prometheus rbd-mirror rgw'.split()
-    REQUIRES_SERVICE_ID = 'iscsi mds nfs osd rgw'.split()
+                          'node-exporter osd prometheus rbd-mirror rgw ' \
+                          'container cephadm-exporter ha-rgw'.split()
+    REQUIRES_SERVICE_ID = 'iscsi mds nfs osd rgw container ha-rgw '.split()
 
     @classmethod
     def _cls(cls, service_type):
@@ -386,7 +393,9 @@ class ServiceSpec(object):
             'nfs': NFSServiceSpec,
             'osd': DriveGroupSpec,
             'iscsi': IscsiServiceSpec,
-            'alertmanager': AlertManagerSpec
+            'alertmanager': AlertManagerSpec,
+            'ha-rgw': HA_RGWSpec,
+            'container': CustomContainerSpec,
         }.get(service_type, cls)
         if ret == ServiceSpec and not service_type:
             raise ServiceSpecValidationError('Spec needs a "service_type" key.')
@@ -584,8 +593,6 @@ class NFSServiceSpec(ServiceSpec):
         #: RADOS namespace where NFS client recovery data is stored in the pool.
         self.namespace = namespace
 
-        self.preview_only = preview_only
-
     def validate(self):
         super(NFSServiceSpec, self).validate()
 
@@ -655,7 +662,6 @@ class RGWSpec(ServiceSpec):
         self.rgw_frontend_ssl_certificate = rgw_frontend_ssl_certificate
         self.rgw_frontend_ssl_key = rgw_frontend_ssl_key
         self.ssl = ssl
-        self.preview_only = preview_only
 
     def get_port(self):
         if self.rgw_frontend_port:
@@ -719,7 +725,6 @@ class IscsiServiceSpec(ServiceSpec):
         self.api_secure = api_secure
         self.ssl_cert = ssl_cert
         self.ssl_key = ssl_key
-        self.preview_only = preview_only
 
         if not self.api_secure and self.ssl_cert and self.ssl_key:
             self.api_secure = True
@@ -730,12 +735,12 @@ class IscsiServiceSpec(ServiceSpec):
         if not self.pool:
             raise ServiceSpecValidationError(
                 'Cannot add ISCSI: No Pool specified')
-        if not self.api_user:
-            raise ServiceSpecValidationError(
-                'Cannot add ISCSI: No Api user specified')
-        if not self.api_password:
-            raise ServiceSpecValidationError(
-                'Cannot add ISCSI: No Api password specified')
+
+        # Do not need to check for api_user and api_password as they
+        # now default to 'admin' when setting up the gateway url. Older
+        # iSCSI specs from before this change should be fine as they will
+        # have been required to have an api_user and api_password set and
+        # will be unaffected by the new default value.
 
 
 yaml.add_representer(IscsiServiceSpec, ServiceSpec.yaml_representer)
@@ -774,3 +779,156 @@ class AlertManagerSpec(ServiceSpec):
 
 
 yaml.add_representer(AlertManagerSpec, ServiceSpec.yaml_representer)
+
+
+class HA_RGWSpec(ServiceSpec):
+    def __init__(self,
+                 service_type: str = 'ha-rgw',
+                 service_id: Optional[str] = None,
+                 placement: Optional[PlacementSpec] = None,
+                 virtual_ip_interface: Optional[str] = None,
+                 virtual_ip_address: Optional[str] = None,
+                 frontend_port: Optional[int] = None,
+                 ha_proxy_port: Optional[int] = None,
+                 ha_proxy_stats_enabled: Optional[bool] = None,
+                 ha_proxy_stats_user: Optional[str] = None,
+                 ha_proxy_stats_password: Optional[str] = None,
+                 ha_proxy_enable_prometheus_exporter: Optional[bool] = None,
+                 ha_proxy_monitor_uri: Optional[str] = None,
+                 keepalived_password: Optional[str] = None,
+                 ha_proxy_frontend_ssl_certificate: Optional[str] = None,
+                 ha_proxy_frontend_ssl_port: Optional[int] = None,
+                 ha_proxy_ssl_dh_param: Optional[str] = None,
+                 ha_proxy_ssl_ciphers: Optional[List[str]] = None,
+                 ha_proxy_ssl_options: Optional[List[str]] = None,
+                 haproxy_container_image: Optional[str] = None,
+                 keepalived_container_image: Optional[str] = None,
+                 definitive_host_list: Optional[List[HostPlacementSpec]] = None
+                 ):
+        assert service_type == 'ha-rgw'
+        super(HA_RGWSpec, self).__init__('ha-rgw', service_id=service_id, placement=placement)
+
+        self.virtual_ip_interface = virtual_ip_interface
+        self.virtual_ip_address = virtual_ip_address
+        self.frontend_port = frontend_port
+        self.ha_proxy_port = ha_proxy_port
+        self.ha_proxy_stats_enabled = ha_proxy_stats_enabled
+        self.ha_proxy_stats_user = ha_proxy_stats_user
+        self.ha_proxy_stats_password = ha_proxy_stats_password
+        self.ha_proxy_enable_prometheus_exporter = ha_proxy_enable_prometheus_exporter
+        self.ha_proxy_monitor_uri = ha_proxy_monitor_uri
+        self.keepalived_password = keepalived_password
+        self.ha_proxy_frontend_ssl_certificate = ha_proxy_frontend_ssl_certificate
+        self.ha_proxy_frontend_ssl_port = ha_proxy_frontend_ssl_port
+        self.ha_proxy_ssl_dh_param = ha_proxy_ssl_dh_param
+        self.ha_proxy_ssl_ciphers = ha_proxy_ssl_ciphers
+        self.ha_proxy_ssl_options = ha_proxy_ssl_options
+        self.haproxy_container_image = haproxy_container_image
+        self.keepalived_container_image = keepalived_container_image
+        # placeholder variable. Need definitive list of hosts this service will
+        # be placed on in order to generate keepalived config. Will be populated
+        # when applying spec
+        self.definitive_host_list = []  # type: List[HostPlacementSpec]
+
+    def validate(self):
+        super(HA_RGWSpec, self).validate()
+
+        if not self.virtual_ip_interface:
+            raise ServiceSpecValidationError(
+                'Cannot add ha-rgw: No Virtual IP Interface specified')
+        if not self.virtual_ip_address:
+            raise ServiceSpecValidationError(
+                'Cannot add ha-rgw: No Virtual IP Address specified')
+        if not self.frontend_port and not self.ha_proxy_frontend_ssl_certificate:
+            raise ServiceSpecValidationError(
+                'Cannot add ha-rgw: No Frontend Port specified')
+        if not self.ha_proxy_port:
+            raise ServiceSpecValidationError(
+                'Cannot add ha-rgw: No HA Proxy Port specified')
+        if not self.ha_proxy_stats_enabled:
+            raise ServiceSpecValidationError(
+                'Cannot add ha-rgw: Ha Proxy Stats Enabled option not set')
+        if not self.ha_proxy_stats_user:
+            raise ServiceSpecValidationError(
+                'Cannot add ha-rgw: No HA Proxy Stats User specified')
+        if not self.ha_proxy_stats_password:
+            raise ServiceSpecValidationError(
+                'Cannot add ha-rgw: No HA Proxy Stats Password specified')
+        if not self.ha_proxy_enable_prometheus_exporter:
+            raise ServiceSpecValidationError(
+                'Cannot add ha-rgw: HA Proxy Enable Prometheus Exporter option not set')
+        if not self.ha_proxy_monitor_uri:
+            raise ServiceSpecValidationError(
+                'Cannot add ha-rgw: No HA Proxy Monitor Uri specified')
+        if not self.keepalived_password:
+            raise ServiceSpecValidationError(
+                'Cannot add ha-rgw: No Keepalived Password specified')
+        if self.ha_proxy_frontend_ssl_certificate:
+            if not self.ha_proxy_frontend_ssl_port:
+                raise ServiceSpecValidationError(
+                    'Cannot add ha-rgw: Specified Ha Proxy Frontend SSL ' +
+                    'Certificate but no SSL Port')
+
+
+class CustomContainerSpec(ServiceSpec):
+    def __init__(self,
+                 service_type: str = 'container',
+                 service_id: str = None,
+                 placement: Optional[PlacementSpec] = None,
+                 unmanaged: bool = False,
+                 preview_only: bool = False,
+                 image: str = None,
+                 entrypoint: Optional[str] = None,
+                 uid: Optional[int] = None,
+                 gid: Optional[int] = None,
+                 volume_mounts: Optional[Dict[str, str]] = {},
+                 args: Optional[List[str]] = [],
+                 envs: Optional[List[str]] = [],
+                 privileged: Optional[bool] = False,
+                 bind_mounts: Optional[List[List[str]]] = None,
+                 ports: Optional[List[int]] = [],
+                 dirs: Optional[List[str]] = [],
+                 files: Optional[Dict[str, Any]] = {},
+                 ):
+        assert service_type == 'container'
+        assert service_id is not None
+        assert image is not None
+
+        super(CustomContainerSpec, self).__init__(
+            service_type, service_id,
+            placement=placement, unmanaged=unmanaged,
+            preview_only=preview_only)
+
+        self.image = image
+        self.entrypoint = entrypoint
+        self.uid = uid
+        self.gid = gid
+        self.volume_mounts = volume_mounts
+        self.args = args
+        self.envs = envs
+        self.privileged = privileged
+        self.bind_mounts = bind_mounts
+        self.ports = ports
+        self.dirs = dirs
+        self.files = files
+
+    def config_json(self) -> Dict[str, Any]:
+        """
+        Helper function to get the value of the `--config-json` cephadm
+        command line option. It will contain all specification properties
+        that haven't a `None` value. Such properties will get default
+        values in cephadm.
+        :return: Returns a dictionary containing all specification
+            properties.
+        """
+        config_json = {}
+        for prop in ['image', 'entrypoint', 'uid', 'gid', 'args',
+                     'envs', 'volume_mounts', 'privileged',
+                     'bind_mounts', 'ports', 'dirs', 'files']:
+            value = getattr(self, prop)
+            if value is not None:
+                config_json[prop] = value
+        return config_json
+
+
+yaml.add_representer(CustomContainerSpec, ServiceSpec.yaml_representer)

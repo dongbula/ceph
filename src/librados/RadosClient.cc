@@ -33,17 +33,10 @@
 #include "include/stringify.h"
 #include "include/util.h"
 
-#include "messages/MLog.h"
 #include "msg/Messenger.h"
 
 // needed for static_cast
-#include "messages/PaxosServiceMessage.h"
-#include "messages/MPoolOpReply.h"
-#include "messages/MStatfsReply.h"
-#include "messages/MGetPoolStatsReply.h"
-#include "messages/MOSDOpReply.h"
-#include "messages/MOSDMap.h"
-#include "messages/MCommandReply.h"
+#include "messages/MLog.h"
 
 #include "AioCompletionImpl.h"
 #include "IoCtxImpl.h"
@@ -63,7 +56,13 @@ namespace ca = ceph::async;
 namespace cb = ceph::buffer;
 
 librados::RadosClient::RadosClient(CephContext *cct_)
-  : Dispatcher(cct_->get()) {}
+  : Dispatcher(cct_->get()),
+    cct_deleter{cct, [](CephContext *p) {p->put();}}
+{
+  auto& conf = cct->_conf;
+  conf.add_observer(this);
+  rados_mon_op_timeout = conf.get_val<std::chrono::seconds>("rados_mon_op_timeout");
+}
 
 int64_t librados::RadosClient::lookup_pool(const char *name)
 {
@@ -219,8 +218,7 @@ int librados::RadosClient::connect()
     return -EISCONN;
   state = CONNECTING;
 
-  if (cct->_conf->log_early &&
-      !cct->_log->is_started()) {
+  if (!cct->_log->is_started()) {
     cct->_log->start();
   }
 
@@ -254,10 +252,7 @@ int librados::RadosClient::connect()
 
   ldout(cct, 1) << "starting objecter" << dendl;
 
-  objecter = new (std::nothrow) Objecter(cct, messenger, &monclient,
-					 poolctx,
-					 cct->_conf->rados_mon_op_timeout,
-					 cct->_conf->rados_osd_op_timeout);
+  objecter = new (std::nothrow) Objecter(cct, messenger, &monclient, poolctx);
   if (!objecter)
     goto out;
   objecter->set_balanced_budget();
@@ -462,6 +457,7 @@ int librados::RadosClient::get_min_compatible_client(int8_t* min_compat_client,
 
 librados::RadosClient::~RadosClient()
 {
+  cct->_conf.remove_observer(this);
   if (messenger)
     delete messenger;
   if (objecter)
@@ -567,11 +563,7 @@ int librados::RadosClient::wait_for_osdmap()
   if (need_map) {
     std::unique_lock l(lock);
 
-    ceph::timespan timeout{0};
-    if (cct->_conf->rados_mon_op_timeout > 0) {
-      timeout = ceph::make_timespan(cct->_conf->rados_mon_op_timeout);
-    }
-
+    ceph::timespan timeout = rados_mon_op_timeout;
     if (objecter->with_osdmap(std::mem_fn(&OSDMap::get_epoch)) == 0) {
       ldout(cct, 10) << __func__ << " waiting" << dendl;
       while (objecter->with_osdmap(std::mem_fn(&OSDMap::get_epoch)) == 0) {
@@ -766,9 +758,9 @@ int librados::RadosClient::pool_delete_async(const char *name, PoolAsyncCompleti
   return r;
 }
 
-void librados::RadosClient::blacklist_self(bool set) {
+void librados::RadosClient::blocklist_self(bool set) {
   std::lock_guard l(lock);
-  objecter->blacklist_self(set);
+  objecter->blocklist_self(set);
 }
 
 std::string librados::RadosClient::get_addrs() const {
@@ -777,7 +769,7 @@ std::string librados::RadosClient::get_addrs() const {
   return std::string(cos->strv());
 }
 
-int librados::RadosClient::blacklist_add(const string& client_address,
+int librados::RadosClient::blocklist_add(const string& client_address,
 					 uint32_t expire_seconds)
 {
   entity_addr_t addr;
@@ -788,8 +780,8 @@ int librados::RadosClient::blacklist_add(const string& client_address,
 
   std::stringstream cmd;
   cmd << "{"
-      << "\"prefix\": \"osd blacklist\", "
-      << "\"blacklistop\": \"add\", "
+      << "\"prefix\": \"osd blocklist\", "
+      << "\"blocklistop\": \"add\", "
       << "\"addr\": \"" << client_address << "\"";
   if (expire_seconds != 0) {
     cmd << ", \"expire\": " << expire_seconds << ".0";
@@ -800,6 +792,21 @@ int librados::RadosClient::blacklist_add(const string& client_address,
   cmds.push_back(cmd.str());
   bufferlist inbl;
   int r = mon_command(cmds, inbl, NULL, NULL);
+  if (r == -EINVAL) {
+    // try legacy blacklist command
+    std::stringstream cmd;
+    cmd << "{"
+	<< "\"prefix\": \"osd blacklist\", "
+	<< "\"blacklistop\": \"add\", "
+	<< "\"addr\": \"" << client_address << "\"";
+    if (expire_seconds != 0) {
+      cmd << ", \"expire\": " << expire_seconds << ".0";
+    }
+    cmd << "}";
+    cmds.clear();
+    cmds.push_back(cmd.str());
+    r = mon_command(cmds, inbl, NULL, NULL);
+  }
   if (r < 0) {
     return r;
   }
@@ -852,8 +859,8 @@ int librados::RadosClient::mgr_command(const vector<string>& cmd,
     return r;
 
   lock.unlock();
-  if (conf->rados_mon_op_timeout) {
-    r = cond.wait_for(conf->rados_mon_op_timeout);
+  if (rados_mon_op_timeout.count() > 0) {
+    r = cond.wait_for(rados_mon_op_timeout);
   } else {
     r = cond.wait();
   }
@@ -876,8 +883,8 @@ int librados::RadosClient::mgr_command(
     return r;
 
   lock.unlock();
-  if (conf->rados_mon_op_timeout) {
-    r = cond.wait_for(conf->rados_mon_op_timeout);
+  if (rados_mon_op_timeout.count() > 0) {
+    r = cond.wait_for(rados_mon_op_timeout);
   } else {
     r = cond.wait();
   }
@@ -1150,15 +1157,13 @@ int librados::RadosClient::get_inconsistent_pgs(int64_t pool_id,
   return 0;
 }
 
-namespace {
-const char *config_keys[] = {
-  "librados_thread_count",
-  NULL
-};
-}
-
 const char** librados::RadosClient::get_tracked_conf_keys() const
 {
+  static const char *config_keys[] = {
+    "librados_thread_count",
+    "rados_mon_op_timeout",
+    nullptr
+  };
   return config_keys;
 }
 
@@ -1168,5 +1173,8 @@ void librados::RadosClient::handle_conf_change(const ConfigProxy& conf,
   if (changed.count("librados_thread_count")) {
     poolctx.stop();
     poolctx.start(conf.get_val<std::uint64_t>("librados_thread_count"));
+  }
+  if (changed.count("rados_mon_op_timeout")) {
+    rados_mon_op_timeout = conf.get_val<std::chrono::seconds>("rados_mon_op_timeout");
   }
 }

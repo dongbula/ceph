@@ -76,7 +76,8 @@ class RDMADispatcher {
     ceph::make_mutex("RDMADispatcher::for worker pending list");
   // fixme: lockfree
   std::list<RDMAWorker*> pending_workers;
-  void enqueue_dead_qp(uint32_t qp);
+  void enqueue_dead_qp_lockless(uint32_t qp);
+  void enqueue_dead_qp(uint32_t qpn);
 
  public:
   PerfCounters *perf_logger;
@@ -325,8 +326,12 @@ class RDMAStack : public NetworkStack {
 
   std::atomic<bool> fork_finished = {false};
 
+  virtual Worker* create_worker(CephContext *c, unsigned worker_id) override {
+    return new RDMAWorker(c, worker_id);
+  }
+
  public:
-  explicit RDMAStack(CephContext *cct, const std::string &t);
+  explicit RDMAStack(CephContext *cct);
   virtual ~RDMAStack();
   virtual bool nonblock_connect_need_writable_event() const override { return false; }
 

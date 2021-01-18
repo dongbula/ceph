@@ -15,6 +15,7 @@
 #ifndef CEPH_MDS_SNAP_H
 #define CEPH_MDS_SNAP_H
 
+#include <map>
 #include <string_view>
 
 #include "mdstypes.h"
@@ -39,6 +40,7 @@ struct SnapInfo {
   std::string name;
 
   mutable std::string long_name; ///< cached _$ino_$name
+  std::map<std::string,std::string> metadata;
 };
 WRITE_CLASS_ENCODER(SnapInfo)
 
@@ -74,6 +76,10 @@ struct sr_t {
   void clear_parent_global() { flags &= ~PARENT_GLOBAL; }
   bool is_parent_global() const { return flags & PARENT_GLOBAL; }
 
+  void mark_subvolume() { flags |= SUBVOLUME; }
+  void clear_subvolume() { flags &= ~SUBVOLUME; }
+  bool is_subvolume() const { return flags & SUBVOLUME; }
+
   void encode(ceph::buffer::list &bl) const;
   void decode(ceph::buffer::list::const_iterator &bl);
   void dump(ceph::Formatter *f) const;
@@ -90,7 +96,8 @@ struct sr_t {
 
   __u32 flags = 0;
   enum {
-    PARENT_GLOBAL = 1 << 0,
+    PARENT_GLOBAL	= 1 << 0,
+    SUBVOLUME		= 1 << 1,
   };
 };
 WRITE_CLASS_ENCODER(sr_t)

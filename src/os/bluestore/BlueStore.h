@@ -140,7 +140,10 @@ enum {
   l_bluestore_omap_upper_bound_lat,
   l_bluestore_omap_lower_bound_lat,
   l_bluestore_omap_next_lat,
+  l_bluestore_omap_get_keys_lat,
+  l_bluestore_omap_get_values_lat,
   l_bluestore_clist_lat,
+  l_bluestore_remove_lat,
   l_bluestore_last
 };
 
@@ -297,11 +300,13 @@ public:
       ceph_assert(writing.empty());
     }
 
-    void _add_buffer(BufferCacheShard* cache, Buffer *b, int level, Buffer *near) {
+    void _add_buffer(BufferCacheShard* cache, Buffer* b, int level, Buffer* near) {
       cache->_audit("_add_buffer start");
       buffer_map[b->offset].reset(b);
       if (b->is_writing()) {
-	b->data.reassign_to_mempool(mempool::mempool_bluestore_writing);
+        // we might get already cached data for which resetting mempool is inppropriate
+        // hence calling try_assign_to_mempool
+        b->data.try_assign_to_mempool(mempool::mempool_bluestore_writing);
         if (writing.empty() || writing.rbegin()->seq <= b->seq) {
           writing.push_back(*b);
         } else {
@@ -316,8 +321,8 @@ public:
           writing.insert(it, *b);
         }
       } else {
-	b->data.reassign_to_mempool(mempool::mempool_bluestore_cache_data);
-	cache->_add(b, level, near);
+        b->data.reassign_to_mempool(mempool::mempool_bluestore_cache_data);
+        cache->_add(b, level, near);
       }
       cache->_audit("_add_buffer end");
     }
@@ -1153,7 +1158,7 @@ public:
     // are laid out contiguously on disk, which is not the case in general.
     // Also, it should always be called after calling extent_map.fault_range(),
     // so that the extent map is loaded.
-    int64_t get_ondisk_starting_offset() const {
+    int64_t zoned_get_ondisk_starting_offset() const {
       return extent_map.extent_map.begin()->blob->
 	  get_blob().calc_offset(0, nullptr);
     }
@@ -1225,20 +1230,7 @@ public:
                                    PerfCounters *logger);
     virtual void _add(Onode* o, int level) = 0;
     virtual void _rm(Onode* o) = 0;
-
-    void pin(Onode* o, std::function<bool ()> validator) {
-      std::lock_guard l(lock);
-      if (validator()) {
-        _pin(o);
-      }
-    }
-
-    void unpin(Onode* o, std::function<bool()> validator) {
-      std::lock_guard l(lock);
-      if (validator()) {
-        _unpin(o);
-      }
-    }
+    virtual void _unpin_and_rm(Onode* o) = 0;
 
     virtual void move_pinned(OnodeCacheShard *to, Onode *o) = 0;
     virtual void add_stats(uint64_t *onodes, uint64_t *pinned_onodes) = 0;
@@ -1300,7 +1292,7 @@ public:
     mempool::bluestore_cache_meta::unordered_map<ghobject_t,OnodeRef> onode_map;
 
     friend struct Collection; // for split_cache()
-
+    friend struct Onode; // for put()
     friend struct LruOnodeCacheShard;
     void _remove(const ghobject_t& oid);
   public:
@@ -1321,7 +1313,7 @@ public:
     void dump(CephContext *cct);
 
     /// return true if f true for any item
-    bool map_any(std::function<bool(OnodeRef)> f);
+    bool map_any(std::function<bool(Onode*)> f);
   };
 
   class OpSequencer;
@@ -1666,18 +1658,18 @@ public:
       modified_objects.insert(o);
     }
     void note_removed_object(OnodeRef& o) {
-      onodes.erase(o);
       modified_objects.insert(o);
+      onodes.erase(o);
     }
 
     void zoned_note_new_object(OnodeRef &o) {
       auto [_, ok] = zoned_onode_to_offset_map.emplace(
-	  std::pair<OnodeRef, std::vector<int64_t>>(o, {o->get_ondisk_starting_offset()}));
+	  std::pair<OnodeRef, std::vector<int64_t>>(o, {o->zoned_get_ondisk_starting_offset()}));
       ceph_assert(ok);
     }
 
     void zoned_note_updated_object(OnodeRef &o, int64_t prev_offset) {
-      int64_t new_offset = o->get_ondisk_starting_offset();
+      int64_t new_offset = o->zoned_get_ondisk_starting_offset();
       auto [it, ok] = zoned_onode_to_offset_map.emplace(
 	  std::pair<OnodeRef, std::vector<int64_t>>(o, {-prev_offset, new_offset}));
       if (!ok) {
@@ -1861,6 +1853,8 @@ public:
     DeferredBatch *deferred_running = nullptr;
     DeferredBatch *deferred_pending = nullptr;
 
+    ceph::mutex deferred_lock = ceph::make_mutex("BlueStore::OpSequencer::deferred_lock");
+
     BlueStore *store;
     coll_t cid;
 
@@ -1946,7 +1940,7 @@ public:
 	qcond.wait(l);
 	--kv_submitted_waiters;
       }
-    }
+      }
 
     bool flush_commit(Context *c) {
       std::lock_guard l(qlock);
@@ -1989,9 +1983,17 @@ public:
   struct KVFinalizeThread : public Thread {
     BlueStore *store;
     explicit KVFinalizeThread(BlueStore *s) : store(s) {}
-    void *entry() {
+    void *entry() override {
       store->_kv_finalize_thread();
       return NULL;
+    }
+  };
+  struct ZonedCleanerThread : public Thread {
+    BlueStore *store;
+    explicit ZonedCleanerThread(BlueStore *s) : store(s) {}
+    void *entry() override {
+      store->_zoned_cleaner_thread();
+      return nullptr;
     }
   };
 
@@ -2051,7 +2053,9 @@ private:
   BlockDevice *bdev = nullptr;
   std::string freelist_type;
   FreelistManager *fm = nullptr;
-  Allocator *alloc = nullptr;
+
+  bluefs_shared_alloc_context_t shared_alloc;
+
   uuid_d fsid;
   int path_fd = -1;  ///< open handle to $path
   int fsid_fd = -1;  ///< open handle (locked) to $path/fsid
@@ -2080,7 +2084,7 @@ private:
       ceph::make_mutex("BlueStore::atomic_alloc_and_submit_lock");
   std::atomic<uint64_t> deferred_seq = {0};
   deferred_osr_queue_t deferred_queue; ///< osr's with deferred io pending
-  int deferred_queue_size = 0;         ///< num txc's queued across all osrs
+  std::atomic_int deferred_queue_size = {0};         ///< num txc's queued across all osrs
   std::atomic_int deferred_aggressive = {0}; ///< aggressive wakeup of kv thread
   Finisher  finisher;
   utime_t  deferred_last_submitted = utime_t();
@@ -2106,6 +2110,13 @@ private:
   std::deque<DeferredBatch*> deferred_stable_to_finalize; ///< pending finalization
   bool kv_finalize_in_progress = false;
 
+  ZonedCleanerThread zoned_cleaner_thread;
+  ceph::mutex zoned_cleaner_lock = ceph::make_mutex("BlueStore::zoned_cleaner_lock");
+  ceph::condition_variable zoned_cleaner_cond;
+  bool zoned_cleaner_started = false;
+  bool zoned_cleaner_stop = false;
+  std::deque<uint64_t> zoned_cleaner_queue;
+
   PerfCounters *logger = nullptr;
 
   std::list<CollectionRef> removed_collections;
@@ -2128,7 +2139,12 @@ private:
 		std::numeric_limits<decltype(min_alloc_size)>::digits,
 		"not enough bits for min_alloc_size");
 
-  bool per_pool_omap = false;
+  enum {
+    // Please preserve the order since it's DB persistent
+    OMAP_BULK = 0,
+    OMAP_PER_POOL = 1,
+    OMAP_PER_PG = 2,
+    } per_pool_omap = OMAP_BULK;
 
   ///< maximum allocation unit (power of 2)
   std::atomic<uint64_t> max_alloc_size = {0};
@@ -2157,6 +2173,7 @@ private:
   uint64_t cache_size = 0;       ///< total cache size
   double cache_meta_ratio = 0;   ///< cache ratio dedicated to metadata
   double cache_kv_ratio = 0;     ///< cache ratio dedicated to kv (e.g., rocksdb)
+  double cache_kv_onode_ratio = 0; ///< cache ratio dedicated to kv onodes (e.g., rocksdb onode CF)
   double cache_data_ratio = 0;   ///< cache ratio dedicated to object data
   bool cache_autotune = false;   ///< cache autotune setting
   double cache_autotune_interval = 0; ///< time to wait between cache rebalancing
@@ -2184,6 +2201,7 @@ private:
     ceph::mutex lock = ceph::make_mutex("BlueStore::MempoolThread::lock");
     bool stop = false;
     std::shared_ptr<PriorityCache::PriCache> binned_kv_cache = nullptr;
+    std::shared_ptr<PriorityCache::PriCache> binned_kv_onode_cache = nullptr;
     std::shared_ptr<PriorityCache::Manager> pcm = nullptr;
 
     struct MempoolCache : public PriorityCache::PriCache {
@@ -2353,24 +2371,19 @@ private:
 
   int _minimal_open_bluefs(bool create);
   void _minimal_close_bluefs();
-  int _open_bluefs(bool create);
+  int _open_bluefs(bool create, bool read_only);
   void _close_bluefs(bool cold_close);
-
-  // Limited (u)mount intended for BlueFS operations only
-  int _mount_for_bluefs();
-  void _umount_for_bluefs();
-
 
   int _is_bluefs(bool create, bool* ret);
   /*
   * opens both DB and dependant super_meta, FreelistManager and allocator
   * in the proper order
   */
-  int _open_db_and_around(bool read_only);
+  int _open_db_and_around(bool read_only, bool to_repair = false);
   void _close_db_and_around(bool read_only);
+
   int _prepare_db_environment(bool create, bool read_only,
 			      std::string* kv_dir, std::string* kv_backend);
-  int _close_db_environment();
 
   /*
    * @warning to_repair_db means that we open this db to repair it, will not
@@ -2383,7 +2396,8 @@ private:
   int _open_fm(KeyValueDB::Transaction t, bool read_only);
   void _close_fm();
   int _write_out_fm_meta(uint64_t target_size);
-  int _open_alloc();
+  int _create_alloc();
+  int _init_alloc();
   void _close_alloc();
   int _open_collections();
   void _fsck_collections(int64_t* errors);
@@ -2393,18 +2407,10 @@ private:
 				   bool create);
 
   // Functions related to zoned storage.
-
-  // For now, to avoid interface changes we piggyback zone_size (in MiB) and the
-  // first sequential zone number onto min_alloc_size and pass it to functions
-  // Allocator::create and FreelistManager::create.
-  uint64_t _piggyback_zoned_device_parameters_onto(uint64_t min_alloc_size) {
-    uint64_t zone_size = bdev->get_zone_size();
-    uint64_t zone_size_mb = zone_size / (1024 * 1024);
-    uint64_t first_seq_zone = bdev->get_conventional_region_size() / zone_size;
-    min_alloc_size |= (zone_size_mb << 32);
-    min_alloc_size |= (first_seq_zone << 48);
-    return min_alloc_size;
-  }
+  uint64_t _zoned_piggyback_device_parameters_onto(uint64_t min_alloc_size);
+  int _zoned_check_config_settings();
+  void _zoned_update_cleaning_metadata(TransContext *txc);
+  std::string _zoned_get_prefix(uint64_t offset);
 
 public:
   utime_t get_deferred_last_submitted() {
@@ -2475,6 +2481,11 @@ private:
   void _kv_sync_thread();
   void _kv_finalize_thread();
 
+  void _zoned_cleaner_start();
+  void _zoned_cleaner_stop();
+  void _zoned_cleaner_thread();
+  void _zoned_clean_zone(uint64_t zone_num);
+
   bluestore_deferred_op_t *_get_deferred_op(TransContext *txc);
   void _deferred_queue(TransContext *txc);
 public:
@@ -2534,7 +2545,7 @@ private:
 
   int _collection_list(
     Collection *c, const ghobject_t& start, const ghobject_t& end,
-    int max, std::vector<ghobject_t> *ls, ghobject_t *next);
+    int max, bool legacy, std::vector<ghobject_t> *ls, ghobject_t *next);
 
   template <typename T, typename F>
   T select_option(const std::string& opt_name, T val1, F f) {
@@ -2610,27 +2621,20 @@ public:
   bool test_mount_in_use() override;
 
 private:
-  int _mount(bool kv_only, bool open_db=true);
+  int _mount();
 public:
   int mount() override {
-    return _mount(false);
+    return _mount();
   }
   int umount() override;
 
-  int start_kv_only(KeyValueDB **pdb, bool open_db=true) {
-    int r = _mount(true, open_db);
-    if (r < 0)
-      return r;
-    *pdb = db;
-    return 0;
-  }
-
-  int open_db_environment(KeyValueDB **pdb);
+  int open_db_environment(KeyValueDB **pdb, bool to_repair);
   int close_db_environment();
 
   int write_meta(const std::string& key, const std::string& value) override;
   int read_meta(const std::string& key, std::string *value) override;
 
+  // open in read-only and limited mode
   int cold_open();
   int cold_close();
 
@@ -2858,6 +2862,13 @@ public:
 		      int max,
 		      std::vector<ghobject_t> *ls, ghobject_t *next) override;
 
+  int collection_list_legacy(CollectionHandle &c,
+                             const ghobject_t& start,
+                             const ghobject_t& end,
+                             int max,
+                             std::vector<ghobject_t> *ls,
+                             ghobject_t *next) override;
+
   int omap_get(
     CollectionHandle &c,     ///< [in] Collection containing oid
     const ghobject_t &oid,   ///< [in] Object containing omap
@@ -2957,6 +2968,9 @@ public:
   const PerfCounters* get_bluefs_perf_counters() const {
     return bluefs->get_perf_counters();
   }
+  KeyValueDB* get_kv() {
+    return db;
+  }
 
   int queue_transactions(
     CollectionHandle& ch,
@@ -3037,7 +3051,7 @@ private:
   std::set<std::string> failed_compressors;
   std::string spillover_alert;
   std::string legacy_statfs_alert;
-  std::string no_per_pool_omap_alert;
+  std::string no_per_pg_omap_alert;
   std::string disk_size_mismatch_alert;
   std::string spurious_read_errors_alert;
 
@@ -3067,7 +3081,7 @@ private:
   }
 
   void _check_legacy_statfs_alert();
-  void _check_no_per_pool_omap_alert();
+  void _check_no_per_pg_omap_alert();
   void _set_disk_size_mismatch_alert(const std::string& s) {
     std::lock_guard l(qlock);
     disk_size_mismatch_alert = s;
@@ -3444,10 +3458,6 @@ private:
 
   void _fsck_check_objects(FSCKDepth depth,
     FSCK_ObjectCtx& ctx);
-
-  // Zoned storage related stuff
-  void zoned_update_cleaning_metadata(TransContext *txc);
-  std::string zoned_get_prefix(uint64_t offset);
 };
 
 inline std::ostream& operator<<(std::ostream& out, const BlueStore::volatile_statfs& s) {
@@ -3607,7 +3617,7 @@ public:
     }
   };
 public:
-  void fix_per_pool_omap(KeyValueDB *db);
+  void fix_per_pool_omap(KeyValueDB *db, int);
   bool remove_key(KeyValueDB *db, const std::string& prefix, const std::string& key);
   bool fix_shared_blob(KeyValueDB *db,
 		         uint64_t sbid,

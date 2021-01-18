@@ -1,12 +1,12 @@
 import { Component, OnDestroy, OnInit } from '@angular/core';
 
-import { UserFormModel } from '../../../core/auth/user-form/user-form.model';
-import { MgrModuleService } from '../../api/mgr-module.service';
-import { UserService } from '../../api/user.service';
-import { NotificationType } from '../../enum/notification-type.enum';
-import { AuthStorageService } from '../../services/auth-storage.service';
-import { NotificationService } from '../../services/notification.service';
-import { TelemetryNotificationService } from '../../services/telemetry-notification.service';
+import _ from 'lodash';
+
+import { MgrModuleService } from '~/app/shared/api/mgr-module.service';
+import { NotificationType } from '~/app/shared/enum/notification-type.enum';
+import { AuthStorageService } from '~/app/shared/services/auth-storage.service';
+import { NotificationService } from '~/app/shared/services/notification.service';
+import { TelemetryNotificationService } from '~/app/shared/services/telemetry-notification.service';
 
 @Component({
   selector: 'cd-telemetry-notification',
@@ -19,7 +19,6 @@ export class TelemetryNotificationComponent implements OnInit, OnDestroy {
   constructor(
     private mgrModuleService: MgrModuleService,
     private authStorageService: AuthStorageService,
-    private userService: UserService,
     private notificationService: NotificationService,
     private telemetryNotificationService: TelemetryNotificationService
   ) {}
@@ -30,16 +29,14 @@ export class TelemetryNotificationComponent implements OnInit, OnDestroy {
     });
 
     if (!this.isNotificationHidden()) {
-      const username = this.authStorageService.getUsername();
-      this.userService.get(username).subscribe((user: UserFormModel) => {
-        if (user.roles.includes('administrator')) {
-          this.mgrModuleService.getConfig('telemetry').subscribe((options) => {
-            if (!options['enabled']) {
-              this.telemetryNotificationService.setVisibility(true);
-            }
-          });
-        }
-      });
+      const configOptPermissions = this.authStorageService.getPermissions().configOpt;
+      if (_.every(Object.values(configOptPermissions))) {
+        this.mgrModuleService.getConfig('telemetry').subscribe((options) => {
+          if (!options['enabled']) {
+            this.telemetryNotificationService.setVisibility(true);
+          }
+        });
+      }
     }
   }
 

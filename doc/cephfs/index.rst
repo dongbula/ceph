@@ -77,9 +77,10 @@ Administration
 
     Create a CephFS file system <createfs>
     Administrative commands <administration>
-	Provision/Add/Remove MDS(s) <add-remove-mds>
+    Creating Multiple File Systems <multifs>
+    Provision/Add/Remove MDS(s) <add-remove-mds>
     MDS failover and standby configuration <standby>
-    MDS Cache Size Limits <cache-size-limits>
+    MDS Cache Configuration <cache-configuration>
     MDS Configuration Settings <mds-config-ref>
     Manual: ceph-mds <../../man/8/ceph-mds>
     Export over NFS <nfs>
@@ -89,6 +90,7 @@ Administration
     CephFS Quotas <quota>
     Health messages <health-messages>
     Upgrading old file systems <upgrading>
+    CephFS Top Utility <cephfs-top>
 
 
 .. raw:: html

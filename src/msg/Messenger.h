@@ -59,6 +59,27 @@ struct Interceptor {
     STOP
   };
 
+  enum STEP {
+    START_CLIENT_BANNER_EXCHANGE = 1,
+    START_SERVER_BANNER_EXCHANGE,
+    BANNER_EXCHANGE_BANNER_CONNECTING,
+    BANNER_EXCHANGE,
+    HANDLE_PEER_BANNER_BANNER_CONNECTING,
+    HANDLE_PEER_BANNER,
+    HANDLE_PEER_BANNER_PAYLOAD_HELLO_CONNECTING,
+    HANDLE_PEER_BANNER_PAYLOAD,
+    SEND_AUTH_REQUEST,
+    HANDLE_AUTH_REQUEST_ACCEPTING_SIGN,
+    SEND_CLIENT_IDENTITY,
+    SEND_SERVER_IDENTITY,
+    SEND_RECONNECT,
+    SEND_RECONNECT_OK,
+    READY,
+    HANDLE_MESSAGE,
+    READ_MESSAGE_COMPLETE,
+    SESSION_RETRY
+  };
+
   virtual ~Interceptor() {}
   virtual ACTION intercept(Connection *conn, uint32_t step) = 0;
 };
@@ -95,14 +116,6 @@ public:
 #ifdef UNIT_TESTS_BUILT
   Interceptor *interceptor = nullptr;
 #endif
-
-  /**
-   * Various Messenger conditional config/type flags to allow
-   * different "transport" Messengers to tune themselves
-   */
-  static const int HAS_HEAVY_TRAFFIC    = 0x0001;
-  static const int HAS_MANY_CONNECTIONS = 0x0002;
-  static const int HEARTBEAT            = 0x0004;
 
   /**
    *  The CephContext this Messenger uses. Many other components initialize themselves
@@ -143,15 +156,12 @@ public:
    * @param name entity name to register
    * @param lname logical name of the messenger in this process (e.g., "client")
    * @param nonce nonce value to uniquely identify this instance on the current host
-   * @param features bits for the local connection
-   * @param cflags general std::set of flags to configure transport resources
    */
   static Messenger *create(CephContext *cct,
                            const std::string &type,
                            entity_name_t name,
 			   std::string lname,
-                           uint64_t nonce,
-			   uint64_t cflags);
+                           uint64_t nonce);
 
   static uint64_t get_random_nonce();
   static uint64_t get_pid_nonce();
@@ -162,7 +172,6 @@ public:
    * Create a new messenger instance.
    * Same as the above, but a slightly simpler interface for clients:
    * - Generate a random nonce
-   * - use the default feature bits
    * - get the messenger type from cct
    * - use the client entity_type
    *

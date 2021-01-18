@@ -11,6 +11,7 @@ import {
   OnInit,
   Output,
   PipeTransform,
+  SimpleChanges,
   TemplateRef,
   ViewChild
 } from '@angular/core';
@@ -22,18 +23,18 @@ import {
   SortPropDir,
   TableColumnProp
 } from '@swimlane/ngx-datatable';
-import * as _ from 'lodash';
+import _ from 'lodash';
 import { Observable, Subject, Subscription, timer as observableTimer } from 'rxjs';
 
-import { TableStatus } from '../../../shared/classes/table-status';
-import { Icons } from '../../../shared/enum/icons.enum';
-import { CellTemplate } from '../../enum/cell-template.enum';
-import { CdTableColumn } from '../../models/cd-table-column';
-import { CdTableColumnFilter } from '../../models/cd-table-column-filter';
-import { CdTableColumnFiltersChange } from '../../models/cd-table-column-filters-change';
-import { CdTableFetchDataContext } from '../../models/cd-table-fetch-data-context';
-import { CdTableSelection } from '../../models/cd-table-selection';
-import { CdUserConfig } from '../../models/cd-user-config';
+import { TableStatus } from '~/app/shared/classes/table-status';
+import { CellTemplate } from '~/app/shared/enum/cell-template.enum';
+import { Icons } from '~/app/shared/enum/icons.enum';
+import { CdTableColumn } from '~/app/shared/models/cd-table-column';
+import { CdTableColumnFilter } from '~/app/shared/models/cd-table-column-filter';
+import { CdTableColumnFiltersChange } from '~/app/shared/models/cd-table-column-filters-change';
+import { CdTableFetchDataContext } from '~/app/shared/models/cd-table-fetch-data-context';
+import { CdTableSelection } from '~/app/shared/models/cd-table-selection';
+import { CdUserConfig } from '~/app/shared/models/cd-user-config';
 
 @Component({
   selector: 'cd-table',
@@ -584,8 +585,10 @@ export class TableComponent implements AfterContentChecked, OnInit, OnChanges, O
     return _.isEmpty(css) ? undefined : css;
   }
 
-  ngOnChanges() {
-    this.useData();
+  ngOnChanges(changes: SimpleChanges) {
+    if (changes.data && changes.data.currentValue) {
+      this.useData();
+    }
   }
 
   setLimit(e: any) {
@@ -696,7 +699,11 @@ export class TableComponent implements AfterContentChecked, OnInit, OnChanges, O
   }
 
   onSelect($event: any) {
-    this.selection.selected = $event['selected'];
+    // Ensure we do not process DOM 'select' events.
+    // https://github.com/swimlane/ngx-datatable/issues/899
+    if (_.has($event, 'selected')) {
+      this.selection.selected = $event['selected'];
+    }
     this.updateSelection.emit(_.clone(this.selection));
   }
 
@@ -823,7 +830,8 @@ export class TableComponent implements AfterContentChecked, OnInit, OnChanges, O
     };
   }
 
-  toggleExpandRow(row: any, isExpanded: boolean) {
+  toggleExpandRow(row: any, isExpanded: boolean, event: any) {
+    event.stopPropagation();
     if (!isExpanded) {
       // If current row isn't expanded, collapse others
       this.expanded = row;

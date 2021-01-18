@@ -30,19 +30,19 @@ public:
   }
 };
 
-int RGWSI_SysObj_Cache::do_start()
+int RGWSI_SysObj_Cache::do_start(optional_yield y)
 {
   int r = asocket.start();
   if (r < 0) {
     return r;
   }
 
-  r = RGWSI_SysObj_Core::do_start();
+  r = RGWSI_SysObj_Core::do_start(y);
   if (r < 0) {
     return r;
   }
 
-  r = notify_svc->start();
+  r = notify_svc->start(y);
   if (r < 0) {
     return r;
   }
@@ -253,13 +253,13 @@ int RGWSI_SysObj_Cache::set_attrs(const rgw_raw_obj& obj,
   }
   info.status = 0;
   info.flags = CACHE_FLAG_MODIFY_XATTRS;
-  if (objv_tracker) {
-    info.version = objv_tracker->write_version;
-    info.flags |= CACHE_FLAG_OBJV;
-  }
   int ret = RGWSI_SysObj_Core::set_attrs(obj, attrs, rmattrs, objv_tracker, y);
   string name = normal_name(pool, oid);
   if (ret >= 0) {
+    if (objv_tracker && objv_tracker->read_version.ver) {
+      info.version = objv_tracker->read_version;
+      info.flags |= CACHE_FLAG_OBJV;
+    }
     cache.put(name, info, NULL);
     int r = distribute_cache(name, obj, info, UPDATE_OBJ, y);
     if (r < 0)
@@ -288,10 +288,6 @@ int RGWSI_SysObj_Cache::write(const rgw_raw_obj& obj,
   info.status = 0;
   info.data = data;
   info.flags = CACHE_FLAG_XATTRS | CACHE_FLAG_DATA | CACHE_FLAG_META;
-  if (objv_tracker) {
-    info.version = objv_tracker->write_version;
-    info.flags |= CACHE_FLAG_OBJV;
-  }
   ceph::real_time result_mtime;
   int ret = RGWSI_SysObj_Core::write(obj, &result_mtime, attrs,
                                      exclusive, data,
@@ -299,23 +295,18 @@ int RGWSI_SysObj_Cache::write(const rgw_raw_obj& obj,
   if (pmtime) {
     *pmtime = result_mtime;
   }
+  if (objv_tracker && objv_tracker->read_version.ver) {
+    info.version = objv_tracker->read_version;
+    info.flags |= CACHE_FLAG_OBJV;
+  }
   info.meta.mtime = result_mtime;
   info.meta.size = data.length();
   string name = normal_name(pool, oid);
   if (ret >= 0) {
     cache.put(name, info, NULL);
-    // Only distribute the cache information if we did not just create
-    // the object with the exclusive flag. Note: PUT_OBJ_EXCL implies
-    // PUT_OBJ_CREATE. Generally speaking, when successfully creating
-    // a system object with the exclusive flag it is not necessary to
-    // call distribute_cache, as a) it's unclear whether other RGWs
-    // will need that system object in the near-term and b) it
-    // generates additional network traffic.
-    if (!exclusive) {
-      int r = distribute_cache(name, obj, info, UPDATE_OBJ, y);
-      if (r < 0)
-	ldout(cct, 0) << "ERROR: failed to distribute cache for " << obj << dendl;
-    }
+    int r = distribute_cache(name, obj, info, UPDATE_OBJ, y);
+    if (r < 0)
+      ldout(cct, 0) << "ERROR: failed to distribute cache for " << obj << dendl;
   } else {
     cache.remove(name);
   }
@@ -339,13 +330,13 @@ int RGWSI_SysObj_Cache::write_data(const rgw_raw_obj& obj,
   info.status = 0;
   info.flags = CACHE_FLAG_DATA;
 
-  if (objv_tracker) {
-    info.version = objv_tracker->write_version;
-    info.flags |= CACHE_FLAG_OBJV;
-  }
   int ret = RGWSI_SysObj_Core::write_data(obj, data, exclusive, objv_tracker, y);
   string name = normal_name(pool, oid);
   if (ret >= 0) {
+    if (objv_tracker && objv_tracker->read_version.ver) {
+      info.version = objv_tracker->read_version;
+      info.flags |= CACHE_FLAG_OBJV;
+    }
     cache.put(name, info, NULL);
     int r = distribute_cache(name, obj, info, UPDATE_OBJ, y);
     if (r < 0)
@@ -508,9 +499,8 @@ static void cache_list_dump_helper(Formatter* f,
 class RGWSI_SysObj_Cache_ASocketHook : public AdminSocketHook {
   RGWSI_SysObj_Cache *svc;
 
-  static constexpr const char* admin_commands[4][3] = {
-    { "cache list",
-      "cache list name=filter,type=CephString,req=false",
+  static constexpr std::string_view admin_commands[][2] = {
+    { "cache list name=filter,type=CephString,req=false",
       "cache list [filter_str]: list object cache, possibly matching substrings" },
     { "cache inspect name=target,type=CephString,req=true",
       "cache inspect target: print cache element" },

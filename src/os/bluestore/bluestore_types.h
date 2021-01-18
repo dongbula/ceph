@@ -267,6 +267,9 @@ struct bluestore_blob_use_tracker_t {
   void clear() {
     if (num_au != 0) {
       delete[] bytes_per_au;
+      mempool::get_pool(
+        mempool::pool_index_t(mempool::mempool_bluestore_cache_other)).
+          adjust_count(-1, -sizeof(uint32_t) * num_au);
     }
     bytes_per_au = 0;
     au_size = 0;
@@ -906,6 +909,7 @@ std::ostream& operator<<(std::ostream& out, const bluestore_blob_t& o);
 
 /// shared blob state
 struct bluestore_shared_blob_t {
+  MEMPOOL_CLASS_HELPERS();
   uint64_t sbid;                       ///> shared blob id
   bluestore_extent_ref_map_t ref_map;  ///< shared blob extents
 
@@ -936,7 +940,7 @@ std::ostream& operator<<(std::ostream& out, const bluestore_shared_blob_t& o);
 struct bluestore_onode_t {
   uint64_t nid = 0;                    ///< numeric id (locally unique)
   uint64_t size = 0;                   ///< object size
-  // FIXME: bufferptr does not have a mempool
+  // mempool to be assigned to buffer::ptr manually
   std::map<mempool::bluestore_cache_meta::string, ceph::buffer::ptr> attrs;
 
   struct shard_info {
@@ -957,9 +961,10 @@ struct bluestore_onode_t {
   uint8_t flags = 0;
 
   enum {
-    FLAG_OMAP = 1,       ///< object may have omap data
+    FLAG_OMAP = 1,         ///< object may have omap data
     FLAG_PGMETA_OMAP = 2,  ///< omap data is in meta omap prefix
     FLAG_PERPOOL_OMAP = 4, ///< omap data is in per-pool prefix; per-pool keys
+    FLAG_PERPG_OMAP = 8,   ///< omap data is in per-pg prefix; per-pg keys
   };
 
   std::string get_flags_string() const {
@@ -971,7 +976,10 @@ struct bluestore_onode_t {
       s += "+pgmeta_omap";
     }
     if (flags & FLAG_PERPOOL_OMAP) {
-      s += "+perpool_omap";
+      s += "+per_pool_omap";
+    }
+    if (flags & FLAG_PERPG_OMAP) {
+      s += "+per_pg_omap";
     }
     return s;
   }
@@ -997,9 +1005,12 @@ struct bluestore_onode_t {
   bool is_perpool_omap() const {
     return has_flag(FLAG_PERPOOL_OMAP);
   }
+  bool is_perpg_omap() const {
+    return has_flag(FLAG_PERPG_OMAP);
+  }
 
   void set_omap_flags() {
-    set_flag(FLAG_OMAP | FLAG_PERPOOL_OMAP);
+    set_flag(FLAG_OMAP | FLAG_PERPOOL_OMAP | FLAG_PERPG_OMAP);
   }
   void set_omap_flags_pgmeta() {
     set_flag(FLAG_OMAP | FLAG_PGMETA_OMAP);

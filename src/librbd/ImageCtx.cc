@@ -121,6 +121,10 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
       asok_hook(nullptr),
       trace_endpoint("librbd")
   {
+    ldout(cct, 10) << this << " " << __func__ << ": "
+                   << "image_name=" << image_name << ", "
+                   << "image_id=" << image_id << dendl;
+
     if (snap)
       snap_name = snap;
 
@@ -147,6 +151,8 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
   }
 
   ImageCtx::~ImageCtx() {
+    ldout(cct, 10) << this << " " << __func__ << dendl;
+
     ceph_assert(config_watcher == nullptr);
     ceph_assert(image_watcher == NULL);
     ceph_assert(exclusive_lock == NULL);
@@ -173,11 +179,6 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
     delete state;
 
     delete plugin_registry;
-
-    // destroy our AsioEngine via its shared io_context to ensure that we
-    // aren't executing within an AsioEngine-owned strand
-    auto& io_context = asio_engine->get_io_context();
-    boost::asio::post(io_context, [asio_engine=std::move(asio_engine)]() {});
   }
 
   void ImageCtx::init() {
@@ -533,6 +534,18 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
     return 0;
   }
 
+  uint64_t ImageCtx::get_effective_image_size(snap_t in_snap_id) const {
+    auto raw_size = get_image_size(in_snap_id);
+    if (raw_size == 0) {
+      return 0;
+    }
+
+    io::Extents extents = {{raw_size, 0}};
+    io_image_dispatcher->remap_extents(
+            extents, io::IMAGE_EXTENTS_MAP_TYPE_PHYSICAL_TO_LOGICAL);
+    return extents.front().first;
+  }
+
   uint64_t ImageCtx::get_object_count(snap_t in_snap_id) const {
     ceph_assert(ceph_mutex_is_locked(image_lock));
     uint64_t image_size = get_image_size(in_snap_id);
@@ -728,14 +741,8 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
     std::unique_lock image_locker(image_lock);
 
     // reset settings back to global defaults
-    for (auto& key : config_overrides) {
-      std::string value;
-      int r = cct->_conf.get_val(key, &value);
-      ceph_assert(r == 0);
-
-      config.set_val(key, value);
-    }
     config_overrides.clear();
+    config.set_config_values(cct->_conf.get_config_values());
 
     // extract config overrides
     for (auto meta_pair : meta) {
@@ -774,8 +781,6 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
     ASSIGN_OPTION(non_blocking_aio, bool);
     ASSIGN_OPTION(cache, bool);
     ASSIGN_OPTION(sparse_read_threshold_bytes, Option::size_t);
-    ASSIGN_OPTION(readahead_max_bytes, Option::size_t);
-    ASSIGN_OPTION(readahead_disable_after_bytes, Option::size_t);
     ASSIGN_OPTION(clone_copy_on_read, bool);
     ASSIGN_OPTION(enable_alloc_hint, bool);
     ASSIGN_OPTION(mirroring_replay_delay, uint64_t);
@@ -784,6 +789,12 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
     ASSIGN_OPTION(skip_partial_discard, bool);
     ASSIGN_OPTION(discard_granularity_bytes, uint64_t);
     ASSIGN_OPTION(blkin_trace_all, bool);
+
+    auto cache_policy = config.get_val<std::string>("rbd_cache_policy");
+    if (cache_policy == "writethrough" || cache_policy == "writeback") {
+      ASSIGN_OPTION(readahead_max_bytes, Option::size_t);
+      ASSIGN_OPTION(readahead_disable_after_bytes, Option::size_t);
+    }
 
 #undef ASSIGN_OPTION
 
@@ -917,9 +928,13 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
   void ImageCtx::rebuild_data_io_context() {
     auto ctx = std::make_shared<neorados::IOContext>(
       data_ctx.get_id(), data_ctx.get_namespace());
-    ctx->read_snap(snap_id);
-    ctx->write_snap_context(
-      {{snapc.seq, {snapc.snaps.begin(), snapc.snaps.end()}}});
+    if (snap_id != CEPH_NOSNAP) {
+      ctx->read_snap(snap_id);
+    }
+    if (!snapc.snaps.empty()) {
+      ctx->write_snap_context(
+        {{snapc.seq, {snapc.snaps.begin(), snapc.snaps.end()}}});
+    }
 
     // atomically reset the data IOContext to new version
     atomic_store(&data_io_context, ctx);
@@ -927,6 +942,11 @@ librados::IoCtx duplicate_io_ctx(librados::IoCtx& io_ctx) {
 
   IOContext ImageCtx::get_data_io_context() const {
     return atomic_load(&data_io_context);
+  }
+
+  IOContext ImageCtx::duplicate_data_io_context() const {
+    auto ctx = get_data_io_context();
+    return std::make_shared<neorados::IOContext>(*ctx);
   }
 
   void ImageCtx::get_timer_instance(CephContext *cct, SafeTimer **timer,

@@ -7,6 +7,7 @@
 #include <fmt/format.h>
 #include <seastar/net/api.hh>
 #include <seastar/net/inet_address.hh>
+#include <seastar/core/future-util.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
@@ -37,7 +38,7 @@ tell_result_t::tell_result_t(int ret, std::string&& err, ceph::bufferlist&& out)
   : ret{ret}, err(std::move(err)), out(std::move(out))
 {}
 
-tell_result_t::tell_result_t(Formatter* formatter)
+tell_result_t::tell_result_t(std::unique_ptr<Formatter> formatter)
 {
   formatter->flush(out);
 }
@@ -122,7 +123,7 @@ seastar::future<> AdminSocket::finalize_response(
 }
 
 
-seastar::future<> AdminSocket::handle_command(crimson::net::Connection* conn,
+seastar::future<> AdminSocket::handle_command(crimson::net::ConnectionRef conn,
 					      boost::intrusive_ptr<MCommand> m)
 {
   return execute_command(m->cmd, std::move(m->get_data())).then(
@@ -301,7 +302,7 @@ class VersionHook final : public AdminSocketHook {
     f->dump_string("release", ceph_release_to_str());
     f->dump_string("release_type", ceph_release_type());
     f->close_section();
-    return seastar::make_ready_future<tell_result_t>(f.get());
+    return seastar::make_ready_future<tell_result_t>(std::move(f));
   }
 };
 
@@ -322,7 +323,7 @@ class GitVersionHook final : public AdminSocketHook {
     f->open_object_section("version");
     f->dump_string("git_version", git_version_to_str());
     f->close_section();
-    return seastar::make_ready_future<tell_result_t>(f.get());
+    return seastar::make_ready_future<tell_result_t>(std::move(f));
   }
 };
 
@@ -349,7 +350,7 @@ class HelpHook final : public AdminSocketHook {
 	}
       }
       f->close_section();
-      return seastar::make_ready_future<tell_result_t>(f.get());
+      return seastar::make_ready_future<tell_result_t>(std::move(f));
     });
   }
 };
@@ -380,7 +381,7 @@ class GetdescsHook final : public AdminSocketHook {
         cmdnum++;
       }
       f->close_section();
-      return seastar::make_ready_future<tell_result_t>(f.get());
+      return seastar::make_ready_future<tell_result_t>(std::move(f));
     });
   }
 };
@@ -397,8 +398,9 @@ public:
 				      ceph::bufferlist&&) const final
   {
     std::vector<std::string> argv;
-    [[maybe_unused]] bool found = cmd_getval(cmdmap, "injected_args", argv);
-    assert(found);
+    if (!cmd_getval(cmdmap, "injected_args", argv)) {
+      return seastar::make_ready_future<tell_result_t>();
+    }
     const std::string args = boost::algorithm::join(argv, " ");
     return local_conf().inject_args(args).then([] {
       return seastar::make_ready_future<tell_result_t>();
@@ -427,7 +429,7 @@ public:
     f->open_object_section("config_show");
     local_conf().show_config(f.get());
     f->close_section();
-    return seastar::make_ready_future<tell_result_t>(f.get());
+    return seastar::make_ready_future<tell_result_t>(std::move(f));
   }
 };
 
@@ -460,7 +462,7 @@ public:
     f->open_object_section("config_get");
     f->dump_string(var, conf_val);
     f->close_section();
-    return seastar::make_ready_future<tell_result_t>(f.get());
+    return seastar::make_ready_future<tell_result_t>(std::move(f));
   }
 };
 
@@ -491,7 +493,7 @@ public:
       f->open_object_section("config_set");
       f->dump_string("success", "");
       f->close_section();
-      return seastar::make_ready_future<tell_result_t>(f.get());
+      return seastar::make_ready_future<tell_result_t>(std::move(f));
     }).handle_exception_type([](std::invalid_argument& e) {
       return seastar::make_ready_future<tell_result_t>(
         tell_result_t{-EINVAL, e.what()});
@@ -510,7 +512,10 @@ seastar::future<> AdminSocket::register_admin_commands()
     register_command(std::make_unique<ConfigGetHook>()),
     register_command(std::make_unique<ConfigSetHook>()),
     register_command(std::make_unique<ConfigShowHook>()),
-    register_command(std::make_unique<InjectArgsHook>()));
+    register_command(std::make_unique<InjectArgsHook>())
+  ).then_unpack([] {
+    return seastar::now();
+  });
 }
 
 }  // namespace crimson::admin

@@ -8,7 +8,7 @@ add_library(common_prioritycache_obj OBJECT
   PriorityCache.cc)
 
 if(WIN32)
-  add_library(dlfcn_win32 STATIC dlfcn_win32.cc)
+  add_library(dlfcn_win32 STATIC win32/dlfcn.cc win32/errno.cc)
 endif()
 
 set(common_srcs
@@ -33,14 +33,12 @@ set(common_srcs
   Readahead.cc
   RefCountedObj.cc
   SloppyCRCMap.cc
-  SubProcess.cc
   Thread.cc
   Throttle.cc
   Timer.cc
   TracepointProvider.cc
   TrackedOp.cc
   WorkQueue.cc
-  address_helper.cc
   admin_socket.cc
   admin_socket_client.cc
   assert.cc
@@ -74,6 +72,7 @@ set(common_srcs
   histogram.cc
   hobject.cc
   hostname.cc
+  ipaddr.cc
   iso_8601.cc
   lockdep.cc
   mempool.cc
@@ -89,6 +88,7 @@ set(common_srcs
   pick_address.cc
   random_string.cc
   reverse.c
+  run_cmd.cc
   scrub_types.cc
   shared_mutex_debug.cc
   signal.cc
@@ -105,15 +105,18 @@ set(common_srcs
 
 if(WIN32)
   list(APPEND common_srcs
-    blkdev_win32.cc
-    dns_resolve_win32.cc)
+    win32/blkdev.cc
+    win32/dns_resolve.cc
+    win32/ifaddrs.cc
+    win32/registry.cc
+    win32/service.cc
+    win32/SubProcess.cc)
 else()
   list(APPEND common_srcs
     blkdev.cc
     dns_resolve.cc
-    ipaddr.cc
     linux_version.c
-    run_cmd.cc)
+    SubProcess.cc)
 endif()
 
 set_source_files_properties(${CMAKE_SOURCE_DIR}/src/common/version.cc
@@ -134,6 +137,8 @@ elseif(SUN)
   list(APPEND common_srcs solaris_errno.cc)
 elseif(AIX)
   list(APPEND common_srcs aix_errno.cc)
+elseif(WIN32)
+  list(APPEND common_srcs win32/errno.cc)
 endif()
 
 if(WITH_EVENTTRACE)
@@ -165,15 +170,15 @@ set(crc32_srcs
   crc32c.cc
   crc32c_intel_baseline.c
   sctp_crc32.c)
-
 if(HAVE_INTEL)
   list(APPEND crc32_srcs
     crc32c_intel_fast.c)
-  if(HAVE_GOOD_YASM_ELF64)
+  if(HAVE_NASM_X64)
+    set(CMAKE_ASM_FLAGS "-i ${PROJECT_SOURCE_DIR}/src/isa-l/include/ ${CMAKE_ASM_FLAGS}")
     list(APPEND crc32_srcs
-      crc32c_intel_fast_asm.s
+      ${PROJECT_SOURCE_DIR}/src/isa-l/crc/crc32_iscsi_00.asm
       crc32c_intel_fast_zero_asm.s)
-  endif(HAVE_GOOD_YASM_ELF64)
+  endif(HAVE_NASM_X64)
 elseif(HAVE_POWER8)
   list(APPEND crc32_srcs
     crc32c_ppc.c)

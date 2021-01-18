@@ -16,15 +16,14 @@ else()
 endif()
 install(TARGETS rados DESTINATION bin)
 
-if(WITH_BOOST_CONTEXT AND NOT WIN32)
-set(neorados_srcs
-  neorados.cc)
-add_executable(neorados ${neorados_srcs})
-target_include_directories(neorados PRIVATE
-  $<TARGET_PROPERTY:spawn,INTERFACE_INCLUDE_DIRECTORIES>)
-
-target_link_libraries(neorados libneorados spawn ${CMAKE_DL_LIBS})
-#install(TARGETS neorados DESTINATION bin)
+if(NOT WIN32)
+  set(neorados_srcs
+      neorados.cc)
+  add_executable(neorados ${neorados_srcs})
+  target_include_directories(neorados PRIVATE
+    $<TARGET_PROPERTY:spawn,INTERFACE_INCLUDE_DIRECTORIES>)
+  target_link_libraries(neorados libneorados spawn ${CMAKE_DL_LIBS})
+  #install(TARGETS neorados DESTINATION bin)
 endif()
 
 if(WITH_TESTS)
@@ -101,6 +100,9 @@ install(TARGETS osdmaptool DESTINATION bin)
 
 set(ceph-diff-sorted_srcs ceph-diff-sorted.cc)
 add_executable(ceph-diff-sorted ${ceph-diff-sorted_srcs})
+set_target_properties(ceph-diff-sorted PROPERTIES
+  SKIP_RPATH TRUE
+  INSTALL_RPATH "")
 install(TARGETS ceph-diff-sorted DESTINATION bin)
 
 if(WITH_TESTS)
@@ -128,6 +130,7 @@ endif(WITH_TESTS)
 
 if(WITH_CEPHFS)
   add_subdirectory(cephfs)
+  add_subdirectory(cephfs_mirror)
 endif(WITH_CEPHFS)
 
 if(WITH_RBD)
@@ -135,6 +138,9 @@ if(WITH_RBD)
   add_subdirectory(rbd_mirror)
   if(LINUX)
     add_subdirectory(rbd_nbd)
+  endif()
+  if(WIN32)
+    add_subdirectory(rbd_wnbd)
   endif()
   if(FREEBSD)
     add_subdirectory(rbd_ggate)

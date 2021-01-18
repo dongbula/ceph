@@ -2,18 +2,16 @@
 from __future__ import absolute_import
 
 import json
-from contextlib import contextmanager
 import logging
+from contextlib import contextmanager
 
 import cherrypy
-
-from orchestrator import OrchestratorError
-import rbd
 import rados
+import rbd
+from orchestrator import OrchestratorError
 
+from ..exceptions import DashboardException, ViewCacheNoDataException
 from ..services.ceph_service import SendCommandError
-from ..exceptions import ViewCacheNoDataException, DashboardException
-
 
 logger = logging.getLogger('exception')
 
@@ -41,16 +39,20 @@ def serialize_dashboard_exception(e, include_http_status=False, task=None):
     return out
 
 
+# pylint: disable=broad-except
 def dashboard_exception_handler(handler, *args, **kwargs):
     try:
         with handle_rados_error(component=None):  # make the None controller the fallback.
             return handler(*args, **kwargs)
     # Don't catch cherrypy.* Exceptions.
-    except (ViewCacheNoDataException, DashboardException) as e:
+    except (ViewCacheNoDataException, DashboardException) as error:
         logger.exception('Dashboard Exception')
         cherrypy.response.headers['Content-Type'] = 'application/json'
-        cherrypy.response.status = getattr(e, 'status', 400)
-        return json.dumps(serialize_dashboard_exception(e)).encode('utf-8')
+        cherrypy.response.status = getattr(error, 'status', 400)
+        return json.dumps(serialize_dashboard_exception(error)).encode('utf-8')
+    except Exception as error:
+        logger.exception('Internal Server Error')
+        raise error
 
 
 @contextmanager

@@ -5,9 +5,13 @@ import { By } from '@angular/platform-browser';
 import { BrowserDynamicTestingModule } from '@angular/platform-browser-dynamic/testing';
 
 import { NgbModal, NgbNav, NgbNavItem } from '@ng-bootstrap/ng-bootstrap';
+import _ from 'lodash';
 import { configureTestSuite } from 'ng-bullet';
+import { of } from 'rxjs';
 
 import { InventoryDevice } from '../app/ceph/cluster/inventory/inventory-devices/inventory-device.model';
+import { Pool } from '../app/ceph/pool/pool';
+import { OrchestratorService } from '../app/shared/api/orchestrator.service';
 import { TableActionsComponent } from '../app/shared/datatable/table-actions/table-actions.component';
 import { Icons } from '../app/shared/enum/icons.enum';
 import { CdFormGroup } from '../app/shared/forms/cd-form-group';
@@ -15,6 +19,7 @@ import { CdTableAction } from '../app/shared/models/cd-table-action';
 import { CdTableSelection } from '../app/shared/models/cd-table-selection';
 import { CrushNode } from '../app/shared/models/crush-node';
 import { CrushRule, CrushRuleConfig } from '../app/shared/models/crush-rule';
+import { OrchestratorFeature } from '../app/shared/models/orchestrator.enum';
 import { Permission } from '../app/shared/models/permissions';
 import {
   AlertmanagerAlert,
@@ -40,9 +45,18 @@ export function configureTestBed(configuration: any, entryComponents?: any) {
 export class PermissionHelper {
   tac: TableActionsComponent;
   permission: Permission;
+  selection: { single: object; multiple: object[] };
 
-  constructor(permission: Permission) {
+  /**
+   * @param permission The permissions used by this test.
+   * @param selection The selection used by this test. Configure this if
+   *   the table actions require a more complex selection object to perform
+   *   a correct test run.
+   *   Defaults to `{ single: {}, multiple: [{}, {}] }`.
+   */
+  constructor(permission: Permission, selection?: { single: object; multiple: object[] }) {
     this.permission = permission;
+    this.selection = _.defaultTo(selection, { single: {}, multiple: [{}, {}] });
   }
 
   setPermissionsAndGetActions(tableActions: CdTableAction[]): any {
@@ -86,11 +100,13 @@ export class PermissionHelper {
   testScenarios() {
     const result: any = {};
     // 'multiple selections'
-    result.multiple = this.testScenario([{}, {}]);
+    result.multiple = this.testScenario(this.selection.multiple);
     // 'select executing item'
-    result.executing = this.testScenario([{ cdExecuting: 'someAction' }]);
+    result.executing = this.testScenario([
+      _.merge({ cdExecuting: 'someAction' }, this.selection.single)
+    ]);
     // 'select non-executing item'
-    result.single = this.testScenario([{}]);
+    result.single = this.testScenario([this.selection.single]);
     // 'no selection'
     result.no = this.testScenario([]);
 
@@ -99,12 +115,13 @@ export class PermissionHelper {
 
   private testScenario(selection: object[]) {
     this.setSelection(selection);
-    const btn = this.tac.getCurrentButton();
-    return btn ? btn.name : '';
+    const action: CdTableAction = this.tac.currentAction;
+    return action ? action.name : '';
   }
 
   setSelection(selection: object[]) {
     this.tac.selection.selected = selection;
+    this.tac.onSelectionChange();
   }
 }
 
@@ -380,6 +397,18 @@ export class Mocks {
     return { name, type, type_id, id, children, device_class };
   }
 
+  static getPool = (name: string, id: number): Pool => {
+    return _.merge(new Pool(name), {
+      pool: id,
+      type: 'replicated',
+      pg_num: 256,
+      pg_placement_num: 256,
+      pg_num_target: 256,
+      pg_placement_num_target: 256,
+      size: 3
+    });
+  };
+
   /**
    * Create the following test crush map:
    * > default
@@ -578,4 +607,62 @@ export class TabHelper {
     const debugElem: DebugElement = fixture.debugElement;
     return debugElem.queryAll(By.directive(NgbNavItem));
   }
+}
+
+export class OrchestratorHelper {
+  /**
+   * Mock Orchestrator status.
+   * @param available is the Orchestrator enabled?
+   * @param features A list of enabled Orchestrator features.
+   */
+  static mockStatus(available: boolean, features?: OrchestratorFeature[]) {
+    const orchStatus = { available: available, description: '', features: {} };
+    if (features) {
+      features.forEach((feature: OrchestratorFeature) => {
+        orchStatus.features[feature] = { available: true };
+      });
+    }
+    spyOn(TestBed.inject(OrchestratorService), 'status').and.callFake(() => of(orchStatus));
+  }
+}
+
+export class TableActionHelper {
+  /**
+   * Verify table action buttons, including the button disabled state and disable description.
+   *
+   * @param fixture  test fixture
+   * @param tableActions table actions
+   * @param expectResult expected values. e.g. {Create: { disabled: true, disableDesc: 'not supported'}}.
+   *                     Expect the Create button to be disabled with 'not supported' tooltip.
+   */
+  static verifyTableActions = async (
+    fixture: ComponentFixture<any>,
+    tableActions: CdTableAction[],
+    expectResult: {
+      [action: string]: { disabled: boolean; disableDesc: string };
+    }
+  ) => {
+    // click dropdown to update all actions buttons
+    const dropDownToggle = fixture.debugElement.query(By.css('.dropdown-toggle'));
+    dropDownToggle.triggerEventHandler('click', null);
+    fixture.detectChanges();
+    await fixture.whenStable();
+
+    const tableActionElement = fixture.debugElement.query(By.directive(TableActionsComponent));
+    const toClassName = TestBed.inject(TableActionsComponent).toClassName;
+    const getActionElement = (action: CdTableAction) =>
+      tableActionElement.query(By.css(`[ngbDropdownItem].${toClassName(action)}`));
+
+    const actions = {};
+    tableActions.forEach((action) => {
+      const actionElement = getActionElement(action);
+      if (expectResult[action.name]) {
+        actions[action.name] = {
+          disabled: actionElement.classes.disabled,
+          disableDesc: actionElement.properties.title
+        };
+      }
+    });
+    expect(actions).toEqual(expectResult);
+  };
 }

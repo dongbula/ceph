@@ -6,7 +6,7 @@ export class NavigationPageHelper extends PageHelper {
   };
 
   navigations = [
-    { menu: 'NFS', component: 'cd-nfs-501' },
+    { menu: 'NFS', component: 'cd-error' },
     {
       menu: 'Object Gateway',
       submenus: [
@@ -20,13 +20,13 @@ export class NavigationPageHelper extends PageHelper {
       menu: 'Cluster',
       submenus: [
         { menu: 'Hosts', component: 'cd-hosts' },
-        { menu: 'Inventory', component: 'cd-inventory' },
+        { menu: 'Inventory', component: 'cd-error' },
         { menu: 'Monitors', component: 'cd-monitor' },
-        { menu: 'Services', component: 'cd-services' },
+        { menu: 'Services', component: 'cd-error' },
         { menu: 'OSDs', component: 'cd-osd-list' },
         { menu: 'Configuration', component: 'cd-configuration' },
         { menu: 'CRUSH map', component: 'cd-crushmap' },
-        { menu: 'Manager modules', component: 'cd-mgr-module-list' },
+        { menu: 'Manager Modules', component: 'cd-mgr-module-list' },
         { menu: 'Logs', component: 'cd-logs' },
         { menu: 'Monitoring', component: 'cd-prometheus-tabs' }
       ]

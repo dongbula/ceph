@@ -22,6 +22,7 @@
 
 #include "common/config.h"
 #include "common/RefCountedObj.h"
+#include "include/compat.h"
 #include "include/counter.h"
 #include "include/elist.h"
 #include "include/types.h"
@@ -58,6 +59,34 @@ class EMetaBlob;
 struct cinode_lock_info_t {
   int lock;
   int wr_caps;
+};
+
+struct CInodeCommitOperation {
+public:
+  CInodeCommitOperation(int prio, int64_t po)
+    : pool(po), priority(prio) {
+  }
+  CInodeCommitOperation(int prio, int64_t po, file_layout_t l, uint64_t f)
+    : pool(po), priority(prio), _layout(l), _features(f) {
+      update_layout = true;
+  }
+
+  void update(ObjectOperation &op, inode_backtrace_t &bt);
+  int64_t get_pool() { return pool; }
+
+private:
+  int64_t pool;     ///< pool id
+  int priority;
+  bool update_layout = false;
+  file_layout_t _layout;
+  uint64_t _features;
+};
+
+struct CInodeCommitOperations {
+  std::vector<CInodeCommitOperation> ops_vec;
+  inode_backtrace_t bt;
+  version_t version;
+  CInode *in;
 };
 
 /**
@@ -266,36 +295,17 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
   friend class CDir;
   friend std::ostream& operator<<(std::ostream&, const CInode&);
 
-  class scrub_stamp_info_t {
-  public:
-    scrub_stamp_info_t() {}
-    void reset() {
-      scrub_start_version = last_scrub_version = 0;
-      scrub_start_stamp = last_scrub_stamp = utime_t();
-    }
-    /// version we started our latest scrub (whether in-progress or finished)
-    version_t scrub_start_version = 0;
-    /// time we started our latest scrub (whether in-progress or finished)
-    utime_t scrub_start_stamp;
-    /// version we started our most recent finished scrub
-    version_t last_scrub_version = 0;
-    /// time we started our most recent finished scrub
-    utime_t last_scrub_stamp;
-  };
-
-  class scrub_info_t : public scrub_stamp_info_t {
+  class scrub_info_t {
   public:
     scrub_info_t() {}
 
-    CDentry *scrub_parent = nullptr;
-    MDSContext *on_finish = nullptr;
+    version_t last_scrub_version = 0;
+    utime_t last_scrub_stamp;
 
     bool last_scrub_dirty = false; /// are our stamps dirty with respect to disk state?
     bool scrub_in_progress = false; /// are we currently scrubbing?
-    bool children_scrubbed = false;
 
-    /// my own (temporary) stamps and versions for each dirfrag we have
-    std::map<frag_t, scrub_stamp_info_t> dirfrag_stamps; // XXX not part of mempool
+    fragset_t queued_frags;
 
     ScrubHeaderRef header;
   };
@@ -322,7 +332,6 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
   static const int PIN_EXPORTINGCAPS =    22;
   static const int PIN_DIRTYPARENT =      23;
   static const int PIN_DIRWAITER =        24;
-  static const int PIN_SCRUBQUEUE =       25;
 
   // -- dump flags --
   static const int DUMP_INODE_STORE_BASE = (1 << 0);
@@ -358,6 +367,8 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
   static const int STATE_DELAYEDEXPORTPIN	= (1<<19);
   static const int STATE_DISTEPHEMERALPIN       = (1<<20);
   static const int STATE_RANDEPHEMERALPIN       = (1<<21);
+  static const int STATE_CLIENTWRITEABLE	= (1<<22);
+
   // orphan inode needs notification of releasing reference
   static const int STATE_ORPHAN =	STATE_NOTIFYREF;
 
@@ -400,7 +411,7 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
     close_snaprealm();
     clear_file_locks();
     ceph_assert(num_projected_srnodes == 0);
-    ceph_assert(num_caps_wanted == 0);
+    ceph_assert(num_caps_notable == 0);
     ceph_assert(num_subtree_roots == 0);
     ceph_assert(num_exporting_dirs == 0);
     ceph_assert(batch_ops.empty());
@@ -412,18 +423,15 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
 
   std::ostream& print_db_line_prefix(std::ostream& out) override;
 
-  const scrub_info_t *scrub_info() const{
+  const scrub_info_t *scrub_info() const {
     if (!scrub_infop)
       scrub_info_create();
-    return scrub_infop;
+    return scrub_infop.get();
   }
 
-  ScrubHeaderRef get_scrub_header() {
-    if (scrub_infop == nullptr) {
-      return nullptr;
-    } else {
-      return scrub_infop->header;
-    }
+  const ScrubHeaderRef& get_scrub_header() {
+    static const ScrubHeaderRef nullref;
+    return scrub_infop ? scrub_infop->header : nullref;
   }
 
   bool scrub_is_in_progress() const {
@@ -437,32 +445,7 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
    * @param scrub_version What version are we scrubbing at (usually, parent
    * directory's get_projected_version())
    */
-  void scrub_initialize(CDentry *scrub_parent,
-			ScrubHeaderRef& header,
-			MDSContext *f);
-  /**
-   * Get the next dirfrag to scrub. Gives you a frag_t in output param which
-   * you must convert to a CDir (and possibly load off disk).
-   * @param dir A pointer to frag_t, will be filled in with the next dirfrag to
-   * scrub if there is one.
-   * @returns 0 on success, you should scrub the passed-out frag_t right now;
-   * ENOENT: There are no remaining dirfrags to scrub
-   * <0 There was some other error (It will return -ENOTDIR if not a directory)
-   */
-  int scrub_dirfrag_next(frag_t* out_dirfrag);
-  /**
-   * Get the currently scrubbing dirfrags. When returned, the
-   * passed-in list will be filled in with all frag_ts which have
-   * been returned from scrub_dirfrag_next but not sent back
-   * via scrub_dirfrag_finished.
-   */
-  void scrub_dirfrags_scrubbing(frag_vec_t *out_dirfrags);
-  /**
-   * Report to the CInode that a dirfrag it owns has been scrubbed. Call
-   * this for every frag_t returned from scrub_dirfrag_next().
-   * @param dirfrag The frag_t that was scrubbed
-   */
-  void scrub_dirfrag_finished(frag_t dirfrag);
+  void scrub_initialize(ScrubHeaderRef& header);
   /**
    * Call this once the scrub has been completed, whether it's a full
    * recursive scrub on a directory or simply the data on a file (or
@@ -470,19 +453,13 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
    * @param c An out param which is filled in with a Context* that must
    * be complete()ed.
    */
-  void scrub_finished(MDSContext **c);
+  void scrub_finished();
 
-  void scrub_aborted(MDSContext **c);
+  void scrub_aborted();
 
-  /**
-   * Report to the CInode that alldirfrags it owns have been scrubbed.
-   */
-  void scrub_children_finished() {
-    scrub_infop->children_scrubbed = true;
-  }
-  void scrub_set_finisher(MDSContext *c) {
-    ceph_assert(!scrub_infop->on_finish);
-    scrub_infop->on_finish = c;
+  fragset_t& scrub_queued_frags() {
+    ceph_assert(scrub_infop);
+    return scrub_infop->queued_frags;
   }
 
   bool is_multiversion() const {
@@ -761,7 +738,13 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
   void fetch(MDSContext *fin);
   void _fetched(ceph::buffer::list& bl, ceph::buffer::list& bl2, Context *fin);  
 
+  void _commit_ops(int r, C_GatherBuilder &gather_bld,
+                   std::vector<CInodeCommitOperation> &ops_vec,
+                   inode_backtrace_t &bt);
   void build_backtrace(int64_t pool, inode_backtrace_t& bt);
+  void _store_backtrace(std::vector<CInodeCommitOperation> &ops_vec,
+                        inode_backtrace_t &bt, int op_prio);
+  void store_backtrace(CInodeCommitOperations &op, int op_prio);
   void store_backtrace(MDSContext *fin, int op_prio=-1);
   void _stored_backtrace(int r, version_t v, Context *fin);
   void fetch_backtrace(Context *fin, ceph::buffer::list *backtrace);
@@ -904,8 +887,8 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
     }
   }
 
-  int get_num_caps_wanted() const { return num_caps_wanted; }
-  void adjust_num_caps_wanted(int d);
+  int get_num_caps_notable() const { return num_caps_notable; }
+  void adjust_num_caps_notable(int d);
 
   Capability *add_client_cap(client_t client, Session *session,
 			     SnapRealm *conrealm=nullptr, bool new_inode=false);
@@ -931,6 +914,11 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
   bool is_any_caps_wanted() const;
   int get_caps_wanted(int *ploner = 0, int *pother = 0, int shift = 0, int mask = -1) const;
   bool issued_caps_need_gather(SimpleLock *lock);
+
+  // client writeable
+  bool is_clientwriteable() const { return state & STATE_CLIENTWRITEABLE; }
+  void mark_clientwriteable();
+  void clear_clientwriteable();
 
   // -- authority --
   mds_authority_t authority() const override;
@@ -1011,24 +999,22 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
     return !projected_parent.empty();
   }
 
-  mds_rank_t get_export_pin(bool inherit=true, bool ephemeral=true) const;
+  mds_rank_t get_export_pin(bool inherit=true) const;
+  void check_pin_policy(mds_rank_t target);
   void set_export_pin(mds_rank_t rank);
   void queue_export_pin(mds_rank_t target);
   void maybe_export_pin(bool update=false);
 
-  void check_pin_policy();
+  void set_ephemeral_pin(bool dist, bool rand);
+  void clear_ephemeral_pin(bool dist, bool rand);
 
-  void set_ephemeral_dist(bool yes);
-  void maybe_ephemeral_dist(bool update=false);
-  void maybe_ephemeral_dist_children(bool update=false);
   void setxattr_ephemeral_dist(bool val=false);
   bool is_ephemeral_dist() const {
     return state_test(STATE_DISTEPHEMERALPIN);
   }
 
-  double get_ephemeral_rand(bool inherit=true) const;
-  void set_ephemeral_rand(bool yes);
-  void maybe_ephemeral_rand(bool fresh=false, double threshold=-1.0);
+  double get_ephemeral_rand() const;
+  void maybe_ephemeral_rand(double threshold=-1.0);
   void setxattr_ephemeral_rand(double prob=0.0);
   bool is_ephemeral_rand() const {
     return state_test(STATE_RANDEPHEMERALPIN);
@@ -1041,13 +1027,6 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
   bool is_ephemerally_pinned() const {
     return state_test(STATE_DISTEPHEMERALPIN) ||
            state_test(STATE_RANDEPHEMERALPIN);
-  }
-  bool is_exportable(mds_rank_t dest) const;
-
-  void maybe_pin() {
-    maybe_export_pin();
-    maybe_ephemeral_dist();
-    maybe_ephemeral_rand();
   }
 
   void print(std::ostream& out) override;
@@ -1099,7 +1078,6 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
   elist<CInode*>::item item_dirty_dirfrag_dir;
   elist<CInode*>::item item_dirty_dirfrag_nest;
   elist<CInode*>::item item_dirty_dirfrag_dirfragtree;
-  elist<CInode*>::item item_scrub;
 
   // also update RecoveryQueue::RecoveryQueue() if you change this
   elist<CInode*>::item& item_recover_queue = item_dirty_dirfrag_dir;
@@ -1207,7 +1185,7 @@ protected:
   mempool_cap_map client_caps; // client -> caps
   mempool::mds_co::compact_map<int32_t, int32_t> mds_caps_wanted;     // [auth] mds -> caps wanted
   int replica_caps_wanted = 0; // [replica] what i've requested from auth
-  int num_caps_wanted = 0;
+  int num_caps_notable = 0;
 
   ceph_lock_state_t *fcntl_locks = nullptr;
   ceph_lock_state_t *flock_locks = nullptr;
@@ -1260,12 +1238,11 @@ private:
   int num_exporting_dirs = 0;
 
   int stickydir_ref = 0;
-  scrub_info_t *scrub_infop = nullptr;
+  std::unique_ptr<scrub_info_t> scrub_infop;
   /** @} Scrubbing and fsck */
 };
 
 std::ostream& operator<<(std::ostream& out, const CInode& in);
-std::ostream& operator<<(std::ostream& out, const CInode::scrub_stamp_info_t& si);
 
 extern cinode_lock_info_t cinode_lock_info[];
 extern int num_cinode_locks;

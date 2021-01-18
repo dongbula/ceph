@@ -1,10 +1,10 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab ft=cpp
 
-#include "rgw_rados.h"
 #include "rgw_zone.h"
 #include "rgw_rest_conn.h"
 #include "rgw_sal.h"
+#include "rgw_rados.h"
 
 #include "services/svc_zone.h"
 
@@ -76,14 +76,7 @@ int RGWRESTConn::get_url(string& endpoint)
 string RGWRESTConn::get_url()
 {
   string endpoint;
-  if (endpoints.empty()) {
-    ldout(cct, 0) << "WARNING: endpoints not configured for upstream zone" << dendl; /* we'll catch this later */
-    return endpoint;
-  }
-
-  int i = ++counter;
-  endpoint = endpoints[i % endpoints.size()];
-
+  get_url(endpoint);
   return endpoint;
 }
 
@@ -93,7 +86,7 @@ void RGWRESTConn::populate_params(param_vec_t& params, const rgw_user *uid, cons
   populate_zonegroup(params, zonegroup);
 }
 
-int RGWRESTConn::forward(const rgw_user& uid, req_info& info, obj_version *objv, size_t max_response, bufferlist *inbl, bufferlist *outbl)
+int RGWRESTConn::forward(const rgw_user& uid, req_info& info, obj_version *objv, size_t max_response, bufferlist *inbl, bufferlist *outbl, optional_yield y)
 {
   string url;
   int ret = get_url(url);
@@ -108,7 +101,7 @@ int RGWRESTConn::forward(const rgw_user& uid, req_info& info, obj_version *objv,
     params.push_back(param_pair_t(RGW_SYS_PARAM_PREFIX "ver", buf));
   }
   RGWRESTSimpleRequest req(cct, info.method, url, NULL, &params);
-  return req.forward_request(key, info, max_response, inbl, outbl);
+  return req.forward_request(key, info, max_response, inbl, outbl, y);
 }
 
 class StreamObjData : public RGWGetDataCB {
@@ -159,9 +152,10 @@ int RGWRESTConn::put_obj_async(const rgw_user& uid, rgw::sal::RGWObject* obj, ui
   return 0;
 }
 
-int RGWRESTConn::complete_request(RGWRESTStreamS3PutObj *req, string& etag, real_time *mtime)
+int RGWRESTConn::complete_request(RGWRESTStreamS3PutObj *req, string& etag,
+                                  real_time *mtime, optional_yield y)
 {
-  int ret = req->complete_request(&etag, mtime);
+  int ret = req->complete_request(y, &etag, mtime);
   delete req;
 
   return ret;
@@ -300,9 +294,10 @@ int RGWRESTConn::complete_request(RGWRESTStreamRWRequest *req,
                                   real_time *mtime,
                                   uint64_t *psize,
                                   map<string, string> *pattrs,
-                                  map<string, string> *pheaders)
+                                  map<string, string> *pheaders,
+                                  optional_yield y)
 {
-  int ret = req->complete_request(etag, mtime, psize, pattrs, pheaders);
+  int ret = req->complete_request(y, etag, mtime, psize, pattrs, pheaders);
   delete req;
 
   return ret;
@@ -313,7 +308,8 @@ int RGWRESTConn::get_resource(const string& resource,
 		     map<string, string> *extra_headers,
 		     bufferlist& bl,
                      bufferlist *send_data,
-		     RGWHTTPManager *mgr)
+		     RGWHTTPManager *mgr,
+		     optional_yield y)
 {
   string url;
   int ret = get_url(url);
@@ -343,7 +339,7 @@ int RGWRESTConn::get_resource(const string& resource,
     return ret;
   }
 
-  return req.complete_request();
+  return req.complete_request(y);
 }
 
 RGWRESTReadResource::RGWRESTReadResource(RGWRESTConn *_conn,
@@ -380,7 +376,7 @@ void RGWRESTReadResource::init_common(param_vec_t *extra_headers)
   req.set_params(&params);
 }
 
-int RGWRESTReadResource::read()
+int RGWRESTReadResource::read(optional_yield y)
 {
   int ret = req.send_request(&conn->get_key(), headers, resource, mgr);
   if (ret < 0) {
@@ -388,7 +384,7 @@ int RGWRESTReadResource::read()
     return ret;
   }
 
-  return req.complete_request();
+  return req.complete_request(y);
 }
 
 int RGWRESTReadResource::aio_read()
@@ -438,7 +434,7 @@ void RGWRESTSendResource::init_common(param_vec_t *extra_headers)
   req.set_params(&params);
 }
 
-int RGWRESTSendResource::send(bufferlist& outbl)
+int RGWRESTSendResource::send(bufferlist& outbl, optional_yield y)
 {
   req.set_send_length(outbl.length());
   req.set_outbl(outbl);
@@ -449,7 +445,7 @@ int RGWRESTSendResource::send(bufferlist& outbl)
     return ret;
   }
 
-  return req.complete_request();
+  return req.complete_request(y);
 }
 
 int RGWRESTSendResource::aio_send(bufferlist& outbl)

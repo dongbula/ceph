@@ -21,13 +21,14 @@ Synopsis
 
 | **cephadm** **inspect-image**
 
-| **cephadm** **ls**
+| **cephadm** **ls** [-h] [--no-detail] [--legacy-dir LEGACY_DIR]
 
 | **cephadm** **list-networks**
 
 | **cephadm** **adopt** [-h] --name NAME --style STYLE [--cluster CLUSTER]
 |                       [--legacy-dir LEGACY_DIR] [--config-json CONFIG_JSON]
 |                       [--skip-firewalld] [--skip-pull]
+|                       [--container-init]
 
 | **cephadm** **rm-daemon** [-h] --name NAME --fsid FSID [--force]
 |                           [--force-delete-data]
@@ -37,7 +38,7 @@ Synopsis
 | **cephadm** **run** [-h] --name NAME --fsid FSID
 
 | **cephadm** **shell** [-h] [--fsid FSID] [--name NAME] [--config CONFIG]
-                        [--keyring KEYRING] [--mount MOUNT] [--env ENV]
+                        [--keyring KEYRING] --mount [MOUNT [MOUNT ...]] [--env ENV]
                         [--] [command [command ...]]
 
 | **cephadm** **enter** [-h] [--fsid FSID] --name NAME [command [command ...]]
@@ -60,6 +61,7 @@ Synopsis
 |                           [--skip-ssh]
 |                           [--initial-dashboard-user INITIAL_DASHBOARD_USER]
 |                           [--initial-dashboard-password INITIAL_DASHBOARD_PASSWORD]
+|                           [--ssl-dashboard-port SSL_DASHBOARD_PORT]
 |                           [--dashboard-key DASHBOARD_KEY]
 |                           [--dashboard-crt DASHBOARD_CRT]
 |                           [--ssh-config SSH_CONFIG]
@@ -76,13 +78,15 @@ Synopsis
 |                           [--registry-username REGISTRY_USERNAME]
 |                           [--registry-password REGISTRY_PASSWORD]
 |                           [--registry-json REGISTRY_JSON]
+|                           [--container-init]
 
 
 
 | **cephadm** **deploy** [-h] --name NAME --fsid FSID [--config CONFIG]
 |                        [--config-json CONFIG_JSON] [--keyring KEYRING]
 |                        [--key KEY] [--osd-fsid OSD_FSID] [--skip-firewalld]
-|                        [--reconfig] [--allow-ptrace]
+|                        [--tcp-ports TCP_PORTS] [--reconfig] [--allow-ptrace]
+|                        [--container-init]
 
 | **cephadm** **check-host** [-h] [--expect-hostname EXPECT_HOSTNAME]
 
@@ -210,6 +214,7 @@ Arguments:
 * [--skip-ssh                     skip setup of ssh key on local host
 * [--initial-dashboard-user INITIAL_DASHBOARD_USER] Initial user for the dashboard
 * [--initial-dashboard-password INITIAL_DASHBOARD_PASSWORD] Initial password for the initial dashboard user
+* [--ssl-dashboard-port SSL_DASHBOARD_PORT] Port number used to connect with dashboard using SSL
 * [--dashboard-key DASHBOARD_KEY] Dashboard key
 * [--dashboard-crt DASHBOARD_CRT] Dashboard certificate
 * [--ssh-config SSH_CONFIG] SSH config
@@ -233,6 +238,8 @@ Arguments:
 * [--registry-username REGISTRY_USERNAME] username of account to login to on custom registry
 * [--registry-password REGISTRY_PASSWORD] password of account to login to on custom registry
 * [--registry-json REGISTRY_JSON] JSON file containing registry login info (see registry-login command documentation)
+* [--container-init]              Run podman/docker with `--init`
+
 
 ceph-volume
 -----------
@@ -279,8 +286,10 @@ Arguments:
 * [--key KEY]                 key for new daemon
 * [--osd-fsid OSD_FSID]       OSD uuid, if creating an OSD container
 * [--skip-firewalld]          Do not configure firewalld
+* [--tcp-ports                List of tcp ports to open in the host firewall
 * [--reconfig]                Reconfigure a previously deployed daemon
 * [--allow-ptrace]            Allow SYS_PTRACE on daemon container
+* [--container-init]          Run podman/docker with `--init`
 
 
 enter
@@ -343,6 +352,11 @@ list daemon instances known to cephadm on **this** host::
         },
     ...
 
+Arguments:
+
+* [--no-detail]             Do not include daemon status
+* [--legacy-dir LEGACY_DIR] Base directory for legacy daemon data
+
 logs
 ----
 
@@ -353,6 +367,21 @@ print journald logs for a daemon container::
 This is similar to::
 
     journalctl -u mgr.myhost.ysubfo
+
+Can also specify additional journal arguments::
+
+    cephadm logs --name mgr.myhost.ysubfo -- -n 20 # last 20 lines
+    cephadm logs --name mgr.myhost.ysubfo -- -f # follow the log
+
+
+Positional arguments:
+
+* [command]               command (optional)
+
+Arguments:
+
+* [--fsid FSID]           cluster FSID
+* [--name NAME, -n NAME]  daemon name (type.id)
 
 
 prepare-host

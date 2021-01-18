@@ -27,6 +27,7 @@
 #include "rgw_process.h"
 
 #include "rgw_zone.h"
+#include "rgw_sal_rados.h"
 
 #include "services/svc_zone.h"
 
@@ -38,7 +39,7 @@
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_rgw
 
-int RGWListBuckets_ObjStore_SWIFT::get_params()
+int RGWListBuckets_ObjStore_SWIFT::get_params(optional_yield y)
 {
   prefix = s->info.args.get("prefix");
   marker = s->info.args.get("marker");
@@ -175,7 +176,7 @@ void RGWListBuckets_ObjStore_SWIFT::send_response_begin(bool has_buckets)
             global_stats,
             policies_stats,
             attrs,
-            user_quota,
+            s->user->get_info().user_quota,
             static_cast<RGWAccessControlPolicy_SWIFTAcct&>(*s->user_acl));
     dump_errno(s);
     dump_header(s, "Accept-Ranges", "bytes");
@@ -281,7 +282,7 @@ void RGWListBuckets_ObjStore_SWIFT::send_response_end()
             global_stats,
             policies_stats,
             attrs,
-            user_quota,
+            s->user->get_info().user_quota,
             static_cast<RGWAccessControlPolicy_SWIFTAcct&>(*s->user_acl));
     dump_errno(s);
     end_header(s, nullptr, nullptr, s->formatter->get_len(), true);
@@ -292,7 +293,7 @@ void RGWListBuckets_ObjStore_SWIFT::send_response_end()
   }
 }
 
-int RGWListBucket_ObjStore_SWIFT::get_params()
+int RGWListBucket_ObjStore_SWIFT::get_params(optional_yield y)
 {
   prefix = s->info.args.get("prefix");
   marker = s->info.args.get("marker");
@@ -541,9 +542,9 @@ static void dump_container_metadata(struct req_state *s,
   dump_last_modified(s, s->bucket_mtime);
 }
 
-void RGWStatAccount_ObjStore_SWIFT::execute()
+void RGWStatAccount_ObjStore_SWIFT::execute(optional_yield y)
 {
-  RGWStatAccount_ObjStore::execute();
+  RGWStatAccount_ObjStore::execute(y);
   op_ret = store->ctl()->user->get_attrs_by_uid(s->user->get_id(), &attrs, s->yield);
 }
 
@@ -555,7 +556,7 @@ void RGWStatAccount_ObjStore_SWIFT::send_response()
             global_stats,
             policies_stats,
             attrs,
-            user_quota,
+            s->user->get_info().user_quota,
             static_cast<RGWAccessControlPolicy_SWIFTAcct&>(*s->user_acl));
   }
 
@@ -695,7 +696,7 @@ static int get_swift_versioning_settings(
   return 0;
 }
 
-int RGWCreateBucket_ObjStore_SWIFT::get_params()
+int RGWCreateBucket_ObjStore_SWIFT::get_params(optional_yield y)
 {
   bool has_policy;
   uint32_t policy_rw_mask = 0;
@@ -809,9 +810,9 @@ static int get_delete_at_param(req_state *s, boost::optional<real_time> &delete_
   return 0;
 }
 
-int RGWPutObj_ObjStore_SWIFT::verify_permission()
+int RGWPutObj_ObjStore_SWIFT::verify_permission(optional_yield y)
 {
-  op_ret = RGWPutObj_ObjStore::verify_permission();
+  op_ret = RGWPutObj_ObjStore::verify_permission(y);
 
   /* We have to differentiate error codes depending on whether user is
    * anonymous (401 Unauthorized) or he doesn't have necessary permissions
@@ -858,7 +859,7 @@ int RGWPutObj_ObjStore_SWIFT::update_slo_segment_size(rgw_slo_entry& entry) {
     }
     bucket = bucket_info.bucket;
   } else {
-    bucket = s->bucket->get_bi();
+    bucket = s->bucket->get_key();
   }
 
   /* fetch the stored size of the seg (or error if not valid) */
@@ -909,7 +910,7 @@ int RGWPutObj_ObjStore_SWIFT::update_slo_segment_size(rgw_slo_entry& entry) {
   return 0;
 } /* RGWPutObj_ObjStore_SWIFT::update_slo_segment_sizes */
 
-int RGWPutObj_ObjStore_SWIFT::get_params()
+int RGWPutObj_ObjStore_SWIFT::get_params(optional_yield y)
 {
   if (s->has_bad_meta) {
     return -EINVAL;
@@ -1013,7 +1014,7 @@ int RGWPutObj_ObjStore_SWIFT::get_params()
     ofs = slo_info->raw_data.length();
   }
 
-  return RGWPutObj_ObjStore::get_params();
+  return RGWPutObj_ObjStore::get_params(y);
 }
 
 void RGWPutObj_ObjStore_SWIFT::send_response()
@@ -1074,7 +1075,7 @@ static int get_swift_account_settings(req_state * const s,
   return 0;
 }
 
-int RGWPutMetadataAccount_ObjStore_SWIFT::get_params()
+int RGWPutMetadataAccount_ObjStore_SWIFT::get_params(optional_yield y)
 {
   if (s->has_bad_meta) {
     return -EINVAL;
@@ -1112,7 +1113,7 @@ void RGWPutMetadataAccount_ObjStore_SWIFT::send_response()
   rgw_flush_formatter_and_reset(s, s->formatter);
 }
 
-int RGWPutMetadataBucket_ObjStore_SWIFT::get_params()
+int RGWPutMetadataBucket_ObjStore_SWIFT::get_params(optional_yield y)
 {
   if (s->has_bad_meta) {
     return -EINVAL;
@@ -1148,7 +1149,7 @@ void RGWPutMetadataBucket_ObjStore_SWIFT::send_response()
   rgw_flush_formatter_and_reset(s, s->formatter);
 }
 
-int RGWPutMetadataObject_ObjStore_SWIFT::get_params()
+int RGWPutMetadataObject_ObjStore_SWIFT::get_params(optional_yield y)
 {
   if (s->has_bad_meta) {
     return -EINVAL;
@@ -1242,9 +1243,9 @@ static void bulkdelete_respond(const unsigned num_deleted,
   formatter.close_section();
 }
 
-int RGWDeleteObj_ObjStore_SWIFT::verify_permission()
+int RGWDeleteObj_ObjStore_SWIFT::verify_permission(optional_yield y)
 {
-  op_ret = RGWDeleteObj_ObjStore::verify_permission();
+  op_ret = RGWDeleteObj_ObjStore::verify_permission(y);
 
   /* We have to differentiate error codes depending on whether user is
    * anonymous (401 Unauthorized) or he doesn't have necessary permissions
@@ -1256,12 +1257,12 @@ int RGWDeleteObj_ObjStore_SWIFT::verify_permission()
   }
 }
 
-int RGWDeleteObj_ObjStore_SWIFT::get_params()
+int RGWDeleteObj_ObjStore_SWIFT::get_params(optional_yield y)
 {
   const string& mm = s->info.args.get("multipart-manifest");
   multipart_delete = (mm.compare("delete") == 0);
 
-  return RGWDeleteObj_ObjStore::get_params();
+  return RGWDeleteObj_ObjStore::get_params(y);
 }
 
 void RGWDeleteObj_ObjStore_SWIFT::send_response()
@@ -1380,7 +1381,7 @@ int RGWCopyObj_ObjStore_SWIFT::init_dest_policy()
   return 0;
 }
 
-int RGWCopyObj_ObjStore_SWIFT::get_params()
+int RGWCopyObj_ObjStore_SWIFT::get_params(optional_yield y)
 {
   if_mod = s->info.env->get("HTTP_IF_MODIFIED_SINCE");
   if_unmod = s->info.env->get("HTTP_IF_UNMODIFIED_SINCE");
@@ -1396,9 +1397,9 @@ int RGWCopyObj_ObjStore_SWIFT::get_params()
 
   const char * const fresh_meta = s->info.env->get("HTTP_X_FRESH_METADATA");
   if (fresh_meta && strcasecmp(fresh_meta, "TRUE") == 0) {
-    attrs_mod = RGWRados::ATTRSMOD_REPLACE;
+    attrs_mod = rgw::sal::ATTRSMOD_REPLACE;
   } else {
-    attrs_mod = RGWRados::ATTRSMOD_MERGE;
+    attrs_mod = rgw::sal::ATTRSMOD_MERGE;
   }
 
   int r = get_delete_at_param(s, delete_at);
@@ -1467,9 +1468,9 @@ void RGWCopyObj_ObjStore_SWIFT::send_response()
   }
 }
 
-int RGWGetObj_ObjStore_SWIFT::verify_permission()
+int RGWGetObj_ObjStore_SWIFT::verify_permission(optional_yield y)
 {
-  op_ret = RGWGetObj_ObjStore::verify_permission();
+  op_ret = RGWGetObj_ObjStore::verify_permission(y);
 
   /* We have to differentiate error codes depending on whether user is
    * anonymous (401 Unauthorized) or he doesn't have necessary permissions
@@ -1481,18 +1482,18 @@ int RGWGetObj_ObjStore_SWIFT::verify_permission()
   }
 }
 
-int RGWGetObj_ObjStore_SWIFT::get_params()
+int RGWGetObj_ObjStore_SWIFT::get_params(optional_yield y)
 {
   const string& mm = s->info.args.get("multipart-manifest");
   skip_manifest = (mm.compare("get") == 0);
 
-  return RGWGetObj_ObjStore::get_params();
+  return RGWGetObj_ObjStore::get_params(y);
 }
 
-int RGWGetObj_ObjStore_SWIFT::send_response_data_error()
+int RGWGetObj_ObjStore_SWIFT::send_response_data_error(optional_yield y)
 {
   std::string error_content;
-  op_ret = error_handler(op_ret, &error_content);
+  op_ret = error_handler(op_ret, &error_content, y);
   if (! op_ret) {
     /* The error handler has taken care of the error. */
     return 0;
@@ -1833,7 +1834,7 @@ const vector<pair<string, RGWInfo_ObjStore_SWIFT::info>> RGWInfo_ObjStore_SWIFT:
     {"tempauth", {false, RGWInfo_ObjStore_SWIFT::list_tempauth_data}},
 };
 
-void RGWInfo_ObjStore_SWIFT::execute()
+void RGWInfo_ObjStore_SWIFT::execute(optional_yield y)
 {
   bool is_admin_info_enabled = false;
 
@@ -2123,10 +2124,10 @@ void RGWFormPost::get_owner_info(const req_state* const s,
   }
 }
 
-int RGWFormPost::get_params()
+int RGWFormPost::get_params(optional_yield y)
 {
   /* The parentt class extracts boundary info from the Content-Type. */
-  int ret = RGWPostObj_ObjStore::get_params();
+  int ret = RGWPostObj_ObjStore::get_params(y);
   if (ret < 0) {
     return ret;
   }
@@ -2274,7 +2275,7 @@ int RGWFormPost::get_data(ceph::bufferlist& bl, bool& again)
     return r;
   }
 
-  /* Tell RGWPostObj::execute() that it has some data to put. */
+  /* Tell RGWPostObj::execute(optional_yield y) that it has some data to put. */
   again = !boundary;
 
   return bl.length();
@@ -2344,7 +2345,8 @@ RGWOp *RGWHandler_REST_Service_SWIFT::op_delete()
 }
 
 int RGWSwiftWebsiteHandler::serve_errordoc(const int http_ret,
-                                           const std::string error_doc)
+                                           const std::string error_doc,
+					   optional_yield y)
 {
   /* Try to throw it all away. */
   s->formatter->reset();
@@ -2363,7 +2365,7 @@ int RGWSwiftWebsiteHandler::serve_errordoc(const int http_ret,
     }
 
     int error_handler(const int err_no,
-                      std::string* const error_content) override {
+                      std::string* const error_content, optional_yield y) override {
       /* Enforce that any error generated while getting the error page will
        * not be send to a client. This allows us to recover from the double
        * fault situation by sending the original message. */
@@ -2379,11 +2381,12 @@ int RGWSwiftWebsiteHandler::serve_errordoc(const int http_ret,
 
   RGWOp* newop = &get_errpage_op;
   RGWRequest req(0);
-  return rgw_process_authenticated(handler, newop, &req, s, true);
+  return rgw_process_authenticated(handler, newop, &req, s, y, true);
 }
 
 int RGWSwiftWebsiteHandler::error_handler(const int err_no,
-                                          std::string* const error_content)
+                                          std::string* const error_content,
+					  optional_yield y)
 {
   if (!s->bucket.get()) {
     /* No bucket, default no-op handler */
@@ -2394,7 +2397,7 @@ int RGWSwiftWebsiteHandler::error_handler(const int err_no,
 
   if (can_be_website_req() && ! ws_conf.error_doc.empty()) {
     set_req_state_err(s, err_no);
-    return serve_errordoc(s->err.http_ret, ws_conf.error_doc);
+    return serve_errordoc(s->err.http_ret, ws_conf.error_doc, y);
   }
 
   /* Let's go to the default, no-op handler. */
@@ -2440,11 +2443,11 @@ RGWOp* RGWSwiftWebsiteHandler::get_ws_redirect_op()
       : location(location) {
     }
 
-    int verify_permission() override {
+    int verify_permission(optional_yield) override {
       return 0;
     }
 
-    void execute() override {
+    void execute(optional_yield) override {
       op_ret = -ERR_PERMANENT_REDIRECT;
       return;
     }
@@ -2486,7 +2489,7 @@ RGWOp* RGWSwiftWebsiteHandler::get_ws_listing_op()
   class RGWWebsiteListing : public RGWListBucket_ObjStore_SWIFT {
     const std::string prefix_override;
 
-    int get_params() override {
+    int get_params(optional_yield) override {
       prefix = prefix_override;
       max = default_max;
       delimiter = "/";
@@ -2792,12 +2795,12 @@ RGWOp *RGWHandler_REST_Obj_SWIFT::op_options()
 }
 
 
-int RGWHandler_REST_SWIFT::authorize(const DoutPrefixProvider *dpp)
+int RGWHandler_REST_SWIFT::authorize(const DoutPrefixProvider *dpp, optional_yield y)
 {
-  return rgw::auth::Strategy::apply(dpp, auth_strategy, s);
+  return rgw::auth::Strategy::apply(dpp, auth_strategy, s, y);
 }
 
-int RGWHandler_REST_SWIFT::postauth_init()
+int RGWHandler_REST_SWIFT::postauth_init(optional_yield y)
 {
   struct req_init_state* t = &s->init_state;
 

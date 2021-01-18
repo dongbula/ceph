@@ -11,7 +11,7 @@ import re
 import os
 
 from teuthology.orchestra import run
-from teuthology.orchestra.run import CommandFailedError, ConnectionLostError
+from teuthology.orchestra.run import CommandFailedError
 from tasks.cephfs.fuse_mount import FuseMount
 from tasks.cephfs.cephfs_test_case import CephFSTestCase
 from teuthology.packaging import get_package_version
@@ -263,12 +263,7 @@ class TestClientRecovery(CephFSTestCase):
                                 cap_waited, session_timeout
                             ))
 
-            cap_holder.stdin.close()
-            try:
-                cap_holder.wait()
-            except (CommandFailedError, ConnectionLostError):
-                # We killed it (and possibly its node), so it raises an error
-                pass
+            self.mount_a._kill_background(cap_holder)
         finally:
             # teardown() doesn't quite handle this case cleanly, so help it out
             self.mount_a.resume_netns()
@@ -322,12 +317,7 @@ class TestClientRecovery(CephFSTestCase):
                                 cap_waited, session_timeout / 2.0
                             ))
 
-            cap_holder.stdin.close()
-            try:
-                cap_holder.wait()
-            except (CommandFailedError, ConnectionLostError):
-                # We killed it (and possibly its node), so it raises an error
-                pass
+            self.mount_a._kill_background(cap_holder)
         finally:
             self.mount_a.resume_netns()
 
@@ -396,12 +386,7 @@ class TestClientRecovery(CephFSTestCase):
         self.mount_b.check_filelock(do_flock=flockable)
 
         # Tear down the background process
-        lock_holder.stdin.close()
-        try:
-            lock_holder.wait()
-        except (CommandFailedError, ConnectionLostError):
-            # We killed it, so it raises an error
-            pass
+        self.mount_a._kill_background(lock_holder)
 
     def test_filelock_eviction(self):
         """
@@ -429,6 +414,9 @@ class TestClientRecovery(CephFSTestCase):
             # succeed
             self.wait_until_true(lambda: lock_taker.finished, timeout=10)
         finally:
+            # Tear down the background process
+            self.mount_a._kill_background(lock_holder)
+
             # teardown() doesn't quite handle this case cleanly, so help it out
             self.mount_a.kill()
             self.mount_a.kill_cleanup()
@@ -619,10 +607,10 @@ class TestClientRecovery(CephFSTestCase):
 
         self.mount_a.kill_cleanup()
 
-    def test_reconnect_after_blacklisted(self):
+    def test_reconnect_after_blocklisted(self):
         """
-        Test reconnect after blacklisted.
-        - writing to a fd that was opened before blacklist should return -EBADF
+        Test reconnect after blocklisted.
+        - writing to a fd that was opened before blocklist should return -EBADF
         - reading/writing to a file with lost file locks should return -EIO
         - readonly fd should continue to work
         """
@@ -630,17 +618,17 @@ class TestClientRecovery(CephFSTestCase):
         self.mount_a.umount_wait()
 
         if isinstance(self.mount_a, FuseMount):
-            self.mount_a.mount(mount_options=['--client_reconnect_stale=1', '--fuse_disable_pagecache=1'])
+            self.mount_a.mount(mntopts=['--client_reconnect_stale=1', '--fuse_disable_pagecache=1'])
         else:
             try:
-                self.mount_a.mount(mount_options=['recover_session=clean'])
+                self.mount_a.mount(mntopts=['recover_session=clean'])
             except CommandFailedError:
                 self.mount_a.kill_cleanup()
                 self.skipTest("Not implemented in current kernel")
 
         self.mount_a.wait_until_mounted()
 
-        path = os.path.join(self.mount_a.mountpoint, 'testfile_reconnect_after_blacklisted')
+        path = os.path.join(self.mount_a.mountpoint, 'testfile_reconnect_after_blocklisted')
         pyscript = dedent("""
             import os
             import sys
@@ -660,7 +648,7 @@ class TestClientRecovery(CephFSTestCase):
             os.read(fd4, 1);
             fcntl.flock(fd4, fcntl.LOCK_SH | fcntl.LOCK_NB)
 
-            print("blacklist")
+            print("blocklist")
             sys.stdout.flush()
 
             sys.stdin.readline()
@@ -669,7 +657,7 @@ class TestClientRecovery(CephFSTestCase):
             time.sleep(10);
 
             # trigger 'open session' message. kclient relies on 'session reject' message
-            # to detect if itself is blacklisted
+            # to detect if itself is blocklisted
             try:
                 os.stat("{path}.1")
             except:

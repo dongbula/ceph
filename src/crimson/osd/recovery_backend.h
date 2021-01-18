@@ -12,6 +12,7 @@
 #include "crimson/osd/shard_services.h"
 
 #include "messages/MOSDPGBackfill.h"
+#include "messages/MOSDPGBackfillRemove.h"
 #include "messages/MOSDPGScan.h"
 #include "osd/recovery_types.h"
 #include "osd/osd_types.h"
@@ -30,6 +31,8 @@ class RecoveryBackend {
   seastar::future<> handle_backfill_finish_ack(
     MOSDPGBackfill& m);
   seastar::future<> handle_backfill(MOSDPGBackfill& m);
+
+  seastar::future<> handle_backfill_remove(MOSDPGBackfillRemove& m);
 
   seastar::future<> handle_scan_get_digest(
     MOSDPGScan& m);
@@ -50,16 +53,22 @@ public:
       coll{coll},
       backend{backend} {}
   virtual ~RecoveryBackend() {}
+  WaitForObjectRecovery& add_recovering(const hobject_t& soid) {
+    auto [it, added] = recovering.emplace(soid, WaitForObjectRecovery{});
+    assert(added);
+    return it->second;
+  }
   WaitForObjectRecovery& get_recovering(const hobject_t& soid) {
-    return recovering[soid];
+    assert(is_recovering(soid));
+    return recovering.at(soid);
   }
   void remove_recovering(const hobject_t& soid) {
     recovering.erase(soid);
   }
-  bool is_recovering(const hobject_t& soid) {
+  bool is_recovering(const hobject_t& soid) const {
     return recovering.count(soid) != 0;
   }
-  uint64_t total_recovering() {
+  uint64_t total_recovering() const {
     return recovering.size();
   }
 
@@ -125,7 +134,7 @@ protected:
     static constexpr const char* type_name = "WaitForObjectRecovery";
 
     crimson::osd::ObjectContextRef obc;
-    PullInfo pi;
+    std::optional<PullInfo> pi;
     std::map<pg_shard_t, PushInfo> pushing;
 
     seastar::future<> wait_for_readable() {
@@ -136,6 +145,11 @@ protected:
     }
     seastar::future<> wait_for_recovered() {
       return recovered.get_shared_future();
+    }
+    crimson::osd::blocking_future<>
+    wait_for_recovered_blocking() {
+      return make_blocking_future(
+	  recovered.get_shared_future());
     }
     seastar::future<> wait_for_pull() {
       return pulled.get_shared_future();
@@ -152,16 +166,19 @@ protected:
     void set_pulled() {
       pulled.set_value();
     }
-    void interrupt(const std::string& why) {
+    void set_push_failed(pg_shard_t shard, std::exception_ptr e) {
+      pushes.at(shard).set_exception(e);
+    }
+    void interrupt(std::string_view why) {
       readable.set_exception(std::system_error(
-	    std::make_error_code(std::errc::interrupted), why));
+        std::make_error_code(std::errc::interrupted), why.data()));
       recovered.set_exception(std::system_error(
-	    std::make_error_code(std::errc::interrupted), why));
+        std::make_error_code(std::errc::interrupted), why.data()));
       pulled.set_exception(std::system_error(
-	    std::make_error_code(std::errc::interrupted), why));
+        std::make_error_code(std::errc::interrupted), why.data()));
       for (auto& [pg_shard, pr] : pushes) {
-	pr.set_exception(std::system_error(
-	      std::make_error_code(std::errc::interrupted), why));
+        pr.set_exception(std::system_error(
+          std::make_error_code(std::errc::interrupted), why.data()));
       }
     }
     void stop();
@@ -171,7 +188,7 @@ protected:
   std::map<hobject_t, WaitForObjectRecovery> recovering;
   hobject_t get_temp_recovery_object(
     const hobject_t& target,
-    eversion_t version);
+    eversion_t version) const;
 
   boost::container::flat_set<hobject_t> temp_contents;
 
@@ -181,6 +198,6 @@ protected:
   void clear_temp_obj(const hobject_t &oid) {
     temp_contents.erase(oid);
   }
-  void clean_up(ceph::os::Transaction& t, const std::string& why);
+  void clean_up(ceph::os::Transaction& t, std::string_view why);
   virtual seastar::future<> on_stop() = 0;
 };

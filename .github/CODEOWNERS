@@ -3,11 +3,11 @@
 /qa/suites/rados/dashboard                      @ceph/dashboard
 /qa/tasks/mgr/test_dashboard.py                 @ceph/dashboard
 /qa/tasks/mgr/dashboard                         @ceph/dashboard
-/monitoring/grafana                             @ceph/dashboard
-/monitoring/prometheus                          @ceph/dashboard
+/monitoring                                     @ceph/dashboard
 /doc/mgr/dashboard.rst                          @ceph/dashboard
 
 # Dashboard API team
+/src/pybind/mgr/dashboard/openapi.yaml                 @ceph/api
 /src/pybind/mgr/dashboard/controllers                  @ceph/api
 /src/pybind/mgr/dashboard/frontend/src/app/shared/api  @ceph/api
 /src/pybind/mgr/dashboard/run-backend-api-tests.sh     @ceph/api
@@ -32,6 +32,7 @@
 /doc/mgr/orchestrator_modules.rst               @ceph/orchestrators
 /doc/cephadm                                    @ceph/orchestrators
 /doc/dev/cephadm.rst                            @ceph/orchestrators
+/doc/man/8/cephadm.rst                          @ceph/orchestrators
 
 #ceph-volume
 /src/ceph-volume                                @ceph/ceph-volume

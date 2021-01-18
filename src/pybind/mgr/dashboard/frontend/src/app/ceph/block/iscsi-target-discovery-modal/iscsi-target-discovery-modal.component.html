@@ -17,7 +17,8 @@
             <input id="user"
                    class="form-control"
                    formControlName="user"
-                   type="text">
+                   type="text"
+                   autocomplete="off">
             <span class="invalid-feedback"
                   *ngIf="discoveryForm.showError('user', formDir, 'required')"
                   i18n>This field is required.</span>
@@ -39,17 +40,16 @@
               <input id="password"
                      class="form-control"
                      formControlName="password"
-                     type="password">
+                     type="password"
+                     autocomplete="new-password">
 
               <span class="input-group-append">
                 <button type="button"
                         class="btn btn-light"
                         cdPasswordButton="password">
                 </button>
-                <button type="button"
-                        class="btn btn-light"
-                        cdCopy2ClipboardButton="password">
-                </button>
+                <cd-copy-2-clipboard-button source="password">
+                </cd-copy-2-clipboard-button>
               </span>
             </div>
             <span class="invalid-feedback"
@@ -73,7 +73,8 @@
             <input id="mutual_user"
                    class="form-control"
                    formControlName="mutual_user"
-                   type="text">
+                   type="text"
+                   autocomplete="off">
 
             <span class="invalid-feedback"
                   *ngIf="discoveryForm.showError('mutual_user', formDir, 'required')"
@@ -96,17 +97,16 @@
               <input id="mutual_password"
                      class="form-control"
                      formControlName="mutual_password"
-                     type="password">
+                     type="password"
+                     autocomplete="new-password">
 
               <span class="input-group-append">
                 <button type="button"
                         class="btn btn-light"
                         cdPasswordButton="mutual_password">
                 </button>
-                <button type="button"
-                        class="btn btn-light"
-                        cdCopy2ClipboardButton="mutual_password">
-                </button>
+                <cd-copy-2-clipboard-button source="mutual_password">
+                </cd-copy-2-clipboard-button>
               </span>
             </div>
             <span class="invalid-feedback"
@@ -122,14 +122,10 @@
       </div>
 
       <div class="modal-footer">
-        <cd-submit-button (submitAction)="submitAction()"
-                          [form]="discoveryForm"
-                          *ngIf="hasPermission"
-                          i18n>Submit</cd-submit-button>
-        <cd-back-button [back]="activeModal.close"
-                        name="Cancel"
-                        i18n-name>
-        </cd-back-button>
+        <cd-form-button-panel (submitActionEvent)="submitAction()"
+                              [form]="discoveryForm"
+                              [showSubmit]="hasPermission"
+                              [submitText]="actionLabels.SUBMIT"></cd-form-button-panel>
       </div>
     </form>
   </ng-container>

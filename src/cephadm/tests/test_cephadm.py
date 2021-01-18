@@ -1,22 +1,29 @@
 # type: ignore
-import argparse
 import mock
+from mock import patch
 import os
 import sys
 import unittest
+import threading
+import time
+from http.server import HTTPServer
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 import pytest
 
-if sys.version_info >= (3, 3):
+from .fixtures import exporter
+
+with patch('builtins.open', create=True):
     from importlib.machinery import SourceFileLoader
     cd = SourceFileLoader('cephadm', 'cephadm').load_module()
-else:
-    import imp
-    cd = imp.load_source('cephadm', 'cephadm')
 
 class TestCephAdm(object):
-    def test_is_fsid(self):
+    def test_is_not_fsid(self):
         assert not cd.is_fsid('no-uuid')
+
+    def test_is_fsid(self):
+        assert cd.is_fsid('e863154d-33c7-4350-bca5-921e0467e55b')
 
     def test__get_parser_image(self):
         args = cd._parse_args(['--image', 'foo', 'version'])
@@ -177,6 +184,20 @@ default via fe80::2480:28ec:5097:3fe2 dev wlp2s0 proto ra metric 20600 pref medi
         for address, expected in tests:
             unwrap_test(address, expected)
 
+    def test_wrap_ipv6(self):
+        def wrap_test(address, expected):
+            assert cd.wrap_ipv6(address) == expected
+
+        tests = [
+            ('::1', '[::1]'), ('[::1]', '[::1]'),
+            ('fde4:8dba:82e1:0:5054:ff:fe6a:357',
+             '[fde4:8dba:82e1:0:5054:ff:fe6a:357]'),
+            ('myhost.example.com', 'myhost.example.com'),
+            ('192.168.0.1', '192.168.0.1'),
+            ('', ''), ('fd00::1::1', 'fd00::1::1')]
+        for address, expected in tests:
+            wrap_test(address, expected)
+
     @mock.patch('cephadm.call_throws')
     @mock.patch('cephadm.get_parm')
     def test_registry_login(self, get_parm, call_throws):
@@ -224,3 +245,426 @@ default via fe80::2480:28ec:5097:3fe2 dev wlp2s0 proto ra metric 20600 pref medi
         with pytest.raises(Exception) as e:
             cd.command_registry_login()
         assert str(e.value) == "Failed to login to custom registry @ sample-url as sample-user with given password"
+
+    def test_get_image_info_from_inspect(self):
+        # podman
+        out = """204a01f9b0b6710dd0c0af7f37ce7139c47ff0f0105d778d7104c69282dfbbf1,["docker.io/ceph/ceph@sha256:1cc9b824e1b076cdff52a9aa3f0cc8557d879fb2fbbba0cafed970aca59a3992"]"""
+        r = cd.get_image_info_from_inspect(out, 'registry/ceph/ceph:latest')
+        assert r == {
+            'image_id': '204a01f9b0b6710dd0c0af7f37ce7139c47ff0f0105d778d7104c69282dfbbf1',
+            'repo_digest': 'docker.io/ceph/ceph@sha256:1cc9b824e1b076cdff52a9aa3f0cc8557d879fb2fbbba0cafed970aca59a3992'
+        }
+
+        # docker
+        out = """sha256:16f4549cf7a8f112bbebf7946749e961fbbd1b0838627fe619aab16bc17ce552,["quay.ceph.io/ceph-ci/ceph@sha256:4e13da36c1bd6780b312a985410ae678984c37e6a9493a74c87e4a50b9bda41f"]"""
+        r = cd.get_image_info_from_inspect(out, 'registry/ceph/ceph:latest')
+        assert r == {
+            'image_id': '16f4549cf7a8f112bbebf7946749e961fbbd1b0838627fe619aab16bc17ce552',
+            'repo_digest': 'quay.ceph.io/ceph-ci/ceph@sha256:4e13da36c1bd6780b312a985410ae678984c37e6a9493a74c87e4a50b9bda41f'
+        }
+
+    def test_dict_get(self):
+        result = cd.dict_get({'a': 1}, 'a', require=True)
+        assert result == 1
+        result = cd.dict_get({'a': 1}, 'b')
+        assert result is None
+        result = cd.dict_get({'a': 1}, 'b', default=2)
+        assert result == 2
+
+    def test_dict_get_error(self):
+        with pytest.raises(cd.Error):
+            cd.dict_get({'a': 1}, 'b', require=True)
+
+    def test_dict_get_join(self):
+        result = cd.dict_get_join({'foo': ['a', 'b']}, 'foo')
+        assert result == 'a\nb'
+        result = cd.dict_get_join({'foo': [1, 2]}, 'foo')
+        assert result == '1\n2'
+        result = cd.dict_get_join({'bar': 'a'}, 'bar')
+        assert result == 'a'
+        result = cd.dict_get_join({'a': 1}, 'a')
+        assert result == 1
+
+    def test_last_local_images(self):
+        out = '''
+docker.io/ceph/daemon-base@
+docker.io/ceph/ceph:v15.2.5
+docker.io/ceph/daemon-base:octopus
+        '''
+        image = cd._filter_last_local_ceph_image(out)
+        assert image == 'docker.io/ceph/ceph:v15.2.5'
+
+
+class TestCustomContainer(unittest.TestCase):
+    cc: cd.CustomContainer
+
+    def setUp(self):
+        self.cc = cd.CustomContainer(
+            'e863154d-33c7-4350-bca5-921e0467e55b',
+            'container',
+            config_json={
+                'entrypoint': 'bash',
+                'gid': 1000,
+                'args': [
+                    '--no-healthcheck',
+                    '-p 6800:6800'
+                ],
+                'envs': ['SECRET=password'],
+                'ports': [8080, 8443],
+                'volume_mounts': {
+                    '/CONFIG_DIR': '/foo/conf',
+                    'bar/config': '/bar:ro'
+                },
+                'bind_mounts': [
+                    [
+                        'type=bind',
+                        'source=/CONFIG_DIR',
+                        'destination=/foo/conf',
+                        ''
+                    ],
+                    [
+                        'type=bind',
+                        'source=bar/config',
+                        'destination=/bar:ro',
+                        'ro=true'
+                    ]
+                ]
+            },
+            image='docker.io/library/hello-world:latest'
+        )
+
+    def test_entrypoint(self):
+        self.assertEqual(self.cc.entrypoint, 'bash')
+
+    def test_uid_gid(self):
+        self.assertEqual(self.cc.uid, 65534)
+        self.assertEqual(self.cc.gid, 1000)
+
+    def test_ports(self):
+        self.assertEqual(self.cc.ports, [8080, 8443])
+
+    def test_get_container_args(self):
+        result = self.cc.get_container_args()
+        self.assertEqual(result, [
+            '--no-healthcheck',
+            '-p 6800:6800'
+        ])
+
+    def test_get_container_envs(self):
+        result = self.cc.get_container_envs()
+        self.assertEqual(result, ['SECRET=password'])
+
+    def test_get_container_mounts(self):
+        result = self.cc.get_container_mounts('/xyz')
+        self.assertDictEqual(result, {
+            '/CONFIG_DIR': '/foo/conf',
+            '/xyz/bar/config': '/bar:ro'
+        })
+
+    def test_get_container_binds(self):
+        result = self.cc.get_container_binds('/xyz')
+        self.assertEqual(result, [
+            [
+                'type=bind',
+                'source=/CONFIG_DIR',
+                'destination=/foo/conf',
+                ''
+            ],
+            [
+                'type=bind',
+                'source=/xyz/bar/config',
+                'destination=/bar:ro',
+                'ro=true'
+            ]
+        ])
+
+
+class TestCephadmExporter(object):
+    exporter: cd.CephadmDaemon
+    files_created = []
+    crt = """-----BEGIN CERTIFICATE-----
+MIIC1zCCAb8CEFHoZE2MfUVzo53fzzBKAT0wDQYJKoZIhvcNAQENBQAwKjENMAsG
+A1UECgwEQ2VwaDEZMBcGA1UECwwQY2VwaGFkbS1leHBvcnRlcjAeFw0yMDExMjUy
+MzEwNTVaFw0zMDExMjMyMzEwNTVaMCoxDTALBgNVBAoMBENlcGgxGTAXBgNVBAsM
+EGNlcGhhZG0tZXhwb3J0ZXIwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIB
+AQCsTfcJcXbREqfx1zTUuEmK+lJn9WWjk0URRF1Z+QgPkascNdkX16PnvhbGwXmF
+BTdAcNl7V0U+z4EsGJ7hJsB7qTq6Rb6wNl7r0OxjeWOmB9xbF4Q/KR5yrbM1DA9A
+B5fNswrUXViku5Y2jlOAz+ZMBhYxMx0edqhxSn297j04Z6RF4Mvkc43v0FH7Ju7k
+O5+0VbdzcOdu37DFpoE4Ll2MZ/GuAHcJ8SD06sEdzFEjRCraav976743XcUlhZGX
+ZTTG/Zf/a+wuCjtMG3od7vRFfuRrM5oTE133DuQ5deR7ybcZNDyopDjHF8xB1bAk
+IOz4SbP6Q25K99Czm1K+3kMLAgMBAAEwDQYJKoZIhvcNAQENBQADggEBACmtvZb8
+dJGHx/WC0/JHxnEJCJM2qnn87ELzbbIQL1w1Yb/I6JQYPgq+WiQPaHaLL9eYsm0l
+dFwvrh+WC0JpXDfADnUnkTSB/WpZ2nC+2JxBptrQEuIcqNXpcJd0bKDiHunv04JI
+uEVpTAK05dBV38qNmIlu4HyB4OEnuQpyOr9xpIhdxuJ95O9K0j5BIw98ZaEwYNUP
+Rm3YlQwfS6R5xaBvL9kyfxyAD2joNj44q6w/5zj4egXVIA5VpkQm8DmMtu0Pd2NG
+dzfYRmqrDolh+rty8HiyIxzeDJQ5bj6LKbUkmABvX50nDySVyMfHmt461/n7W65R
+CHFLoOmfJJik+Uc=\n-----END CERTIFICATE-----
+"""
+    key = """-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCsTfcJcXbREqfx
+1zTUuEmK+lJn9WWjk0URRF1Z+QgPkascNdkX16PnvhbGwXmFBTdAcNl7V0U+z4Es
+GJ7hJsB7qTq6Rb6wNl7r0OxjeWOmB9xbF4Q/KR5yrbM1DA9AB5fNswrUXViku5Y2
+jlOAz+ZMBhYxMx0edqhxSn297j04Z6RF4Mvkc43v0FH7Ju7kO5+0VbdzcOdu37DF
+poE4Ll2MZ/GuAHcJ8SD06sEdzFEjRCraav976743XcUlhZGXZTTG/Zf/a+wuCjtM
+G3od7vRFfuRrM5oTE133DuQ5deR7ybcZNDyopDjHF8xB1bAkIOz4SbP6Q25K99Cz
+m1K+3kMLAgMBAAECggEASnAwToMXWsGdjqxzpYasNv9oBIOO0nk4OHp5ffpJUjiT
+XM+ip1tA80g7HMjPD/mt4gge3NtaDgWlf4Bve0O7mnEE7x5cgFIs9eG/jkYOF9eD
+ilMBjivcfJywNDWujPH60iIMhqyBNEHaZl1ck+S9UJC8m6rCZLvMj40n/5riFfBy
+1sjf2uOwcfWrjSj9Ju4wlMI6khSSz2aYC7glQQ/fo2+YArbEUcy60iloPQ6wEgZK
+okoVWZA9AehwLcnRjkwd9EVmMMtRGPE/AcP4s/kKA0tRDRicPLN727Ke/yxv+Ppo
+hbIZIcOn7soOFAENcodJ4YRSCd++QfCNaVAi7vwWWQKBgQDeBY4vvr+H0brbSjQg
+O7Fpqub/fxZY3UoHWDqWs2X4o3qhDqaTQODpuYtCm8YQE//55JoLWKAD0evq5dLS
+YLrtC1Vyxf+TA7opCUjWBe+liyndbJdB5q0zF7qdWUtQKGVSWyUWhK8gHa6M64fP
+oi83DD7F0OGusTWGtfbceErk/wKBgQDGrJLRo/5xnAH5VmPfNu+S6h0M2qM6CYwe
+Y5wHFG2uQQct73adf53SkhvZVmOzJsWQbVnlDOKMhqazcs+7VWRgO5X3naWVcctE
+Hggw9MgpbXAWFOI5sNYsCYE58E+fTHjE6O4A3MhMCsze+CIC3sKuPQBBiL9bWSOX
+8POswqfl9QKBgDe/nVxPwTgRaaH2l/AgDQRDbY1qE+psZlJBzTRaB5jPM9ONIjaH
+a/JELLuk8a7H1tagmC2RK1zKMTriSnWY5FbxKZuQLAR2QyBavHdBNlOTBggbZD+f
+9I2Hv8wSx95wxkBPsphc6Lxft5ya55czWjewU3LIaGK9DHuu5TWm3udxAoGBAJGP
+PsJ59KIoOwoDUYjpJv3sqPwR9CVBeXeKY3aMcQ+KdUgiejVKmsb8ZYsG0GUhsv3u
+ID7BAfsTbG9tXuVR2wjmnymcRwUHKnXtyvKTZVN06vpCsryx4zjAff2FI9ECpjke
+r8HSAK41+4QhKEoSC3C9IMLi/dBfrsRTtTSOKZVBAoGBAI2dl5HEIFpufaI4toWM
+LO5HFrlXgRDGoc/+Byr5/8ZZpYpU115Ol/q6M+l0koV2ygJ9jeJJEllFWykIDS6F
+XxazFI74swAqobHb2ZS/SLhoVxE82DdSeXrjkTvUjNtrW5zs1gIMKBR4nD6H8AqL
+iMN28C2bKGao5UHvdER1rGy7
+-----END PRIVATE KEY-----
+"""
+    token = "MyAccessToken"
+
+    @classmethod
+    def setup_class(cls):
+        # create the ssl files
+        fname = os.path.join(os.getcwd(), 'crt')
+        with open(fname, 'w') as crt:
+            crt.write(cls.crt)
+            cls.files_created.append(fname)
+        fname = os.path.join(os.getcwd(), 'key')
+        with open(fname, 'w') as crt:
+            crt.write(cls.key)
+            cls.files_created.append(fname)
+        fname = os.path.join(os.getcwd(), 'token')
+        with open(fname, 'w') as crt:
+            crt.write(cls.token)
+            cls.files_created.append(fname)
+         # start a simple http instance to test the requesthandler
+        cls.server = HTTPServer(('0.0.0.0', 9443), cd.CephadmDaemonHandler)
+        cls.server.cephadm_cache = cd.CephadmCache()
+        cls.server.token = cls.token
+        t = threading.Thread(target=cls.server.serve_forever)
+        t.daemon = True
+        t.start() 
+
+    @classmethod
+    def teardown_class(cls):
+        cls.server.shutdown()
+        assert len(cls.files_created) > 0
+        for f in cls.files_created:
+            os.remove(f)      
+    
+    def setup_method(self):
+        # re-init the cache for every test
+        TestCephadmExporter.server.cephadm_cache = cd.CephadmCache()
+    
+    def teardown_method(self):
+        pass
+
+    def test_files_ready(self):
+        assert os.path.exists(os.path.join(os.getcwd(), 'crt'))
+        assert os.path.exists(os.path.join(os.getcwd(), 'key'))
+        assert os.path.exists(os.path.join(os.getcwd(), 'token'))
+
+    def test_can_run(self, exporter):
+        assert exporter.can_run
+    
+    def test_token_valid(self, exporter):
+        assert exporter.token == self.token
+
+    def test_unit_name(self,exporter):
+        assert exporter.unit_name
+        assert exporter.unit_name == "ceph-foobar-cephadm-exporter.test.service"
+
+    def test_unit_run(self,exporter):
+        assert exporter.unit_run
+        lines = exporter.unit_run.split('\n')
+        assert len(lines) == 2
+        assert "/var/lib/ceph/foobar/cephadm exporter --fsid foobar --id test --port 9443 &" in lines[1]
+
+    def test_binary_path(self, exporter):
+        # fsid = foobar
+        args = cd._parse_args([])
+        cd.args = args
+        assert exporter.binary_path == "/var/lib/ceph/foobar/cephadm"
+
+    def test_systemd_unit(self, exporter):
+        assert exporter.unit_file
+
+    def test_validate_passes(self, exporter):
+        config = {
+            "crt": self.crt,
+            "key": self.key,
+            "token": self.token,
+        }
+        cd.CephadmDaemon.validate_config(config)
+
+    def test_validate_fails(self, exporter):
+        config = {
+            "key": self.key,
+            "token": self.token,
+        }
+        with pytest.raises(cd.Error):
+            cd.CephadmDaemon.validate_config(config)
+
+    def test_port_active(self, exporter):
+        assert exporter.port_active == True
+
+    def test_rqst_health_200(self):
+        hdrs={"Authorization":f"Bearer {TestCephadmExporter.token}"}
+        req=Request("http://localhost:9443/v1/metadata/health",headers=hdrs)
+        r = urlopen(req)
+        assert r.status == 200
+
+    def test_rqst_all_inactive_500(self):
+        hdrs={"Authorization":f"Bearer {TestCephadmExporter.token}"}
+        req=Request("http://localhost:9443/v1/metadata",headers=hdrs)
+        try:
+            r = urlopen(req)
+        except HTTPError as e:
+            assert e.code == 500
+
+    def test_rqst_no_auth_401(self):
+        req=Request("http://localhost:9443/v1/metadata")
+        try:
+            urlopen(req)
+        except HTTPError as e:
+            assert e.code == 401
+ 
+    def test_rqst_bad_auth_401(self):
+        hdrs={"Authorization":f"Bearer BogusAuthToken"}
+        req=Request("http://localhost:9443/v1/metadata",headers=hdrs)
+        try:
+            urlopen(req)
+        except HTTPError as e:
+            assert e.code == 401
+
+    def test_rqst_badURL_404(self):
+        hdrs={"Authorization":f"Bearer {TestCephadmExporter.token}"}
+        req=Request("http://localhost:9443/v1/metazoic",headers=hdrs)
+        try:
+            urlopen(req)
+        except HTTPError as e:
+            assert e.code == 404
+
+    def test_rqst_inactive_task_204(self):
+        # all tasks initialise as inactive, and then 'go' active as their thread starts
+        # so we can pick any task to check for an inactive response (no content)
+        hdrs={"Authorization":f"Bearer {TestCephadmExporter.token}"}
+        req=Request("http://localhost:9443/v1/metadata/disks",headers=hdrs)
+        r = urlopen(req)
+        assert r.status == 204
+
+    def test_rqst_active_task_200(self):
+        TestCephadmExporter.server.cephadm_cache.tasks['host'] = 'active'
+        hdrs={"Authorization":f"Bearer {TestCephadmExporter.token}"}
+        req=Request("http://localhost:9443/v1/metadata/host",headers=hdrs)
+        r = urlopen(req)
+        assert r.status == 200
+
+    def test_rqst_all_206(self):
+        TestCephadmExporter.server.cephadm_cache.tasks['disks'] = 'active'
+        hdrs={"Authorization":f"Bearer {TestCephadmExporter.token}"}
+        req=Request("http://localhost:9443/v1/metadata",headers=hdrs)
+        r = urlopen(req)
+        assert r.status == 206
+
+    def test_rqst_disks_200(self):
+        TestCephadmExporter.server.cephadm_cache.tasks['disks'] = 'active'
+        hdrs={"Authorization":f"Bearer {TestCephadmExporter.token}"}
+        req=Request("http://localhost:9443/v1/metadata/disks",headers=hdrs)
+        r = urlopen(req)
+        assert r.status == 200
+
+    def test_thread_exception(self, exporter):
+        # run is patched to invoke a mocked scrape_host thread that will raise so 
+        # we check here that the exception handler updates the cache object as we'd
+        # expect with the error
+        exporter.run()
+        assert exporter.cephadm_cache.host['scrape_errors']
+        assert exporter.cephadm_cache.host['scrape_errors'] == ['ValueError exception: wah']
+        assert exporter.cephadm_cache.errors == ['host thread stopped']
+
+    # Test the requesthandler does the right thing with invalid methods...
+    # ie. return a "501" - Not Implemented / Unsupported Method
+    def test_invalid_method_HEAD(self):
+        hdrs={"Authorization":f"Bearer {TestCephadmExporter.token}"}
+        req=Request("http://localhost:9443/v1/metadata/health",headers=hdrs, method="HEAD")
+        with pytest.raises(HTTPError, match=r"HTTP Error 501: .*") as e:
+            urlopen(req)
+
+    def test_invalid_method_DELETE(self):
+        hdrs={"Authorization":f"Bearer {TestCephadmExporter.token}"}
+        req=Request("http://localhost:9443/v1/metadata/health",headers=hdrs, method="DELETE")
+        with pytest.raises(HTTPError, match=r"HTTP Error 501: .*") as e:
+            urlopen(req)
+
+    def test_invalid_method_POST(self):
+        hdrs={"Authorization":f"Bearer {TestCephadmExporter.token}"}
+        req=Request("http://localhost:9443/v1/metadata/health",headers=hdrs, method="POST")
+        with pytest.raises(HTTPError, match=r"HTTP Error 501: .*") as e:
+            urlopen(req)
+
+    def test_invalid_method_PUT(self):
+        hdrs={"Authorization":f"Bearer {TestCephadmExporter.token}"}
+        req=Request("http://localhost:9443/v1/metadata/health",headers=hdrs, method="PUT")
+        with pytest.raises(HTTPError, match=r"HTTP Error 501: .*") as e:
+            urlopen(req)
+
+    def test_invalid_method_CONNECT(self):
+        hdrs={"Authorization":f"Bearer {TestCephadmExporter.token}"}
+        req=Request("http://localhost:9443/v1/metadata/health",headers=hdrs, method="CONNECT")
+        with pytest.raises(HTTPError, match=r"HTTP Error 501: .*") as e:
+            urlopen(req)
+
+    def test_invalid_method_TRACE(self):
+        hdrs={"Authorization":f"Bearer {TestCephadmExporter.token}"}
+        req=Request("http://localhost:9443/v1/metadata/health",headers=hdrs, method="TRACE")
+        with pytest.raises(HTTPError, match=r"HTTP Error 501: .*") as e:
+            urlopen(req)
+
+    def test_invalid_method_OPTIONS(self):
+        hdrs={"Authorization":f"Bearer {TestCephadmExporter.token}"}
+        req=Request("http://localhost:9443/v1/metadata/health",headers=hdrs, method="OPTIONS")
+        with pytest.raises(HTTPError, match=r"HTTP Error 501: .*") as e:
+            urlopen(req)
+
+    def test_invalid_method_PATCH(self):
+        hdrs={"Authorization":f"Bearer {TestCephadmExporter.token}"}
+        req=Request("http://localhost:9443/v1/metadata/health",headers=hdrs, method="PATCH")
+        with pytest.raises(HTTPError, match=r"HTTP Error 501: .*") as e:
+            urlopen(req)
+
+
+class TestMaintenance:
+    systemd_target = "ceph.00000000-0000-0000-0000-000000c0ffee.target"
+
+    def test_systemd_target_OK(self, tmp_path):
+        base = tmp_path 
+        wants = base / "ceph.target.wants"
+        wants.mkdir()
+        target = wants / TestMaintenance.systemd_target
+        target.touch()
+        cd.UNIT_DIR = str(base)
+
+        assert cd.systemd_target_state(target.name)
+
+    def test_systemd_target_NOTOK(self, tmp_path):
+        base = tmp_path 
+        cd.UNIT_DIR = str(base)
+        assert not cd.systemd_target_state(TestMaintenance.systemd_target)
+
+    def test_parser_OK(self):
+        args = cd._parse_args(['host-maintenance', 'enter'])
+        assert args.maintenance_action == 'enter'
+
+    def test_parser_BAD(self):
+        with pytest.raises(SystemExit):
+            cd._parse_args(['host-maintenance', 'wah'])

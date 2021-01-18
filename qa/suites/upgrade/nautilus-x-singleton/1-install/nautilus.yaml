@@ -1,10 +1,11 @@
 overrides:
   ceph:
-    log-whitelist:
+    log-ignorelist:
       - \(MON_DOWN\)
       - \(MGR_DOWN\)
       - slow request
       - Not found or unloadable
+      - evicting unresponsive client
 meta:
 - desc: install ceph/nautilus latest
 tasks:

@@ -15,7 +15,7 @@
 #include "include/str_list.h"
 #include "include/stringify.h"
 #include "rgw_common.h"
-#include "rgw_rados.h"
+#include "rgw_sal.h"
 #include "rgw_period_pusher.h"
 #include "rgw_realm_reloader.h"
 #include "rgw_rest.h"
@@ -49,6 +49,9 @@
 #include "rgw_asio_frontend.h"
 #endif /* WITH_RADOSGW_BEAST_FRONTEND */
 #include "rgw_dmclock_scheduler_ctx.h"
+#ifdef WITH_RADOSGW_LUA_PACKAGES
+#include "rgw_lua.h"
+#endif
 
 #include "services/svc_zone.h"
 
@@ -209,8 +212,7 @@ int radosgw_Main(int argc, const char **argv)
   flags |= CINIT_FLAG_DEFER_DROP_PRIVILEGES;
 
   auto cct = global_init(&defaults, args, CEPH_ENTITY_TYPE_CLIENT,
-			 CODE_ENVIRONMENT_DAEMON,
-			 flags, "rgw_data");
+			 CODE_ENVIRONMENT_DAEMON, flags);
 
   // First, let's determine which frontends are configured.
   list<string> frontends;
@@ -404,6 +406,27 @@ int radosgw_Main(int argc, const char **argv)
     }
 #endif
   }
+
+  const auto& luarocks_path = g_conf().get_val<std::string>("rgw_luarocks_location");
+  if (luarocks_path.empty()) {
+    store->set_luarocks_path("");
+  } else {
+    store->set_luarocks_path(luarocks_path+"/"+g_conf()->name.to_str());
+  }
+#ifdef WITH_RADOSGW_LUA_PACKAGES
+  rgw::lua::packages_t failed_packages;
+  std::string output;
+  r = rgw::lua::install_packages(store, null_yield, failed_packages, output);
+  if (r < 0) {
+    dout(1) << "ERROR: failed to install lua packages from allowlist" << dendl;
+  }
+  if (!output.empty()) {
+    dout(10) << "INFO: lua packages installation output: \n" << output << dendl; 
+  }
+  for (const auto& p : failed_packages) {
+    dout(5) << "WARNING: failed to install lua package: " << p << " from allowlist" << dendl;
+  }
+#endif
 
   if (apis_map.count("swift") > 0) {
     RGWRESTMgr_SWIFT* const swift_resource = new RGWRESTMgr_SWIFT;
@@ -601,10 +624,10 @@ int radosgw_Main(int argc, const char **argv)
 
 
   // add a watcher to respond to realm configuration changes
-  RGWPeriodPusher pusher(store);
+  RGWPeriodPusher pusher(store, null_yield);
   RGWFrontendPauser pauser(fes, implicit_tenant_context, &pusher);
-  std::optional<RGWRealmReloader> reloader(std::in_place, store,
-                                           service_map_meta, &pauser);
+  auto reloader = std::make_unique<RGWRealmReloader>(store,
+						     service_map_meta, &pauser);
 
   RGWRealmWatcher realm_watcher(g_ceph_context, store->svc()->zone->get_realm());
   realm_watcher.add_watcher(RGWRealmNotify::Reload, *reloader);

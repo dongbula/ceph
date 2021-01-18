@@ -140,7 +140,7 @@ private:
     unknown,
 #if defined(HAVE_LIBAIO) || defined(HAVE_POSIXAIO)
     aio,
-#if defined(HAVE_LIBZBC)
+#if defined(HAVE_LIBZBD)
     hm_smr,
 #endif
 #endif
@@ -272,13 +272,7 @@ public:
   virtual void close() = 0;
 
 protected:
-  bool is_valid_io(uint64_t off, uint64_t len) const {
-    return (off % block_size == 0 &&
-            len % block_size == 0 &&
-            len > 0 &&
-            off < size &&
-            off + len <= size);
-  }
+  bool is_valid_io(uint64_t off, uint64_t len) const;
 };
 
 #endif //CEPH_BLK_BLOCKDEVICE_H

@@ -4,11 +4,12 @@ Device health monitoring
 
 import errno
 import json
-from mgr_module import MgrModule, CommandResult
+from mgr_module import MgrModule, CommandResult, CLICommand, Option
 import operator
 import rados
 from threading import Event
-from datetime import datetime, timedelta, date, time
+from datetime import datetime, timedelta
+from typing import Optional
 
 TIME_FORMAT = '%Y%m%d-%H%M%S'
 
@@ -17,121 +18,71 @@ DEVICE_HEALTH_IN_USE = 'DEVICE_HEALTH_IN_USE'
 DEVICE_HEALTH_TOOMANY = 'DEVICE_HEALTH_TOOMANY'
 HEALTH_MESSAGES = {
     DEVICE_HEALTH: '%d device(s) expected to fail soon',
-    DEVICE_HEALTH_IN_USE: '%d daemons(s) expected to fail soon and still contain data',
+    DEVICE_HEALTH_IN_USE: '%d daemon(s) expected to fail soon and still contain data',
     DEVICE_HEALTH_TOOMANY: 'Too many daemons are expected to fail soon',
 }
 
-MAX_SAMPLES=500
+MAX_SAMPLES = 500
 
 
 class Module(MgrModule):
     MODULE_OPTIONS = [
-        {
-            'name': 'enable_monitoring',
-            'default': True,
-            'type': 'bool',
-            'desc': 'monitor device health metrics',
-            'runtime': True,
-        },
-        {
-            'name': 'scrape_frequency',
-            'default': 86400,
-            'type': 'secs',
-            'desc': 'how frequently to scrape device health metrics',
-            'runtime': True,
-        },
-        {
-            'name': 'pool_name',
-            'default': 'device_health_metrics',
-            'type': 'str',
-            'desc': 'name of pool in which to store device health metrics',
-            'runtime': True,
-        },
-        {
-            'name': 'retention_period',
-            'default': (86400 * 180),
-            'type': 'secs',
-            'desc': 'how long to retain device health metrics',
-            'runtime': True,
-        },
-        {
-            'name': 'mark_out_threshold',
-            'default': (86400 * 14 * 2),
-            'type': 'secs',
-            'desc': 'automatically mark OSD if it may fail before this long',
-            'runtime': True,
-        },
-        {
-            'name': 'warn_threshold',
-            'default': (86400 * 14 * 6),
-            'type': 'secs',
-            'desc': 'raise health warning if OSD may fail before this long',
-            'runtime': True,
-        },
-        {
-            'name': 'self_heal',
-            'default': True,
-            'type': 'bool',
-            'desc': 'preemptively heal cluster around devices that may fail',
-            'runtime': True,
-        },
-        {
-            'name': 'sleep_interval',
-            'default': 600,
-            'type': 'secs',
-            'desc': 'how frequently to wake up and check device health',
-            'runtime': True,
-        },
-    ]
-
-    COMMANDS = [
-        {
-            "cmd": "device query-daemon-health-metrics "
-                   "name=who,type=CephString",
-            "desc": "Get device health metrics for a given daemon",
-            "perm": "r"
-        },
-        {
-            "cmd": "device scrape-daemon-health-metrics "
-                   "name=who,type=CephString",
-            "desc": "Scrape and store device health metrics "
-                    "for a given daemon",
-            "perm": "r"
-        },
-        {
-            "cmd": "device scrape-health-metrics "
-                   "name=devid,type=CephString,req=False",
-            "desc": "Scrape and store health metrics",
-            "perm": "r"
-        },
-        {
-            "cmd": "device get-health-metrics "
-                   "name=devid,type=CephString "
-                   "name=sample,type=CephString,req=False",
-            "desc": "Show stored device metrics for the device",
-            "perm": "r"
-        },
-        {
-            "cmd": "device check-health",
-            "desc": "Check life expectancy of devices",
-            "perm": "rw",
-        },
-        {
-            "cmd": "device monitoring on",
-            "desc": "Enable device health monitoring",
-            "perm": "rw",
-        },
-        {
-            "cmd": "device monitoring off",
-            "desc": "Disable device health monitoring",
-            "perm": "rw",
-        },
-        {
-            'cmd': 'device predict-life-expectancy '
-                   'name=devid,type=CephString,req=true',
-            'desc': 'Predict life expectancy with local predictor',
-            'perm': 'r'
-        },
+        Option(
+            name='enable_monitoring',
+            default=True,
+            type='bool',
+            desc='monitor device health metrics',
+            runtime=True,
+        ),
+        Option(
+            name='scrape_frequency',
+            default=86400,
+            type='secs',
+            desc='how frequently to scrape device health metrics',
+            runtime=True,
+        ),
+        Option(
+            name='pool_name',
+            default='device_health_metrics',
+            type='str',
+            desc='name of pool in which to store device health metrics',
+            runtime=True,
+        ),
+        Option(
+            name='retention_period',
+            default=(86400 * 180),
+            type='secs',
+            desc='how long to retain device health metrics',
+            runtime=True,
+        ),
+        Option(
+            name='mark_out_threshold',
+            default=(86400 * 14 * 2),
+            type='secs',
+            desc='automatically mark OSD if it may fail before this long',
+            runtime=True,
+        ),
+        Option(
+            name='warn_threshold',
+            default=(86400 * 14 * 6),
+            type='secs',
+            desc='raise health warning if OSD may fail before this long',
+            runtime=True,
+        ),
+        Option(
+            name='self_heal',
+            default=True,
+            type='bool',
+            desc='preemptively heal cluster around devices that may fail',
+            runtime=True,
+        ),
+        Option(
+            name='sleep_interval',
+            default=600,
+            type='secs',
+            desc='how frequently to wake up and check device health',
+            runtime=True,
+        ),
     ]
 
     def __init__(self, *args, **kwargs):
@@ -144,58 +95,96 @@ class Module(MgrModule):
         # other
         self.run = True
         self.event = Event()
+        self.has_device_pool = False
 
     def is_valid_daemon_name(self, who):
-        l = who.split('.')
-        if len(l) != 2:
+        parts = who.split('.')
+        if len(parts) != 2:
             return False
-        if l[0] not in ('osd', 'mon'):
-            return False;
-        return True;
+        return parts[0] in ('osd', 'mon')
 
     def handle_command(self, _, cmd):
         self.log.error("handle_command")
 
-        if cmd['prefix'] == 'device query-daemon-health-metrics':
-            who = cmd.get('who', '')
-            if not self.is_valid_daemon_name(who):
-                return -errno.EINVAL, '', 'not a valid mon or osd daemon name'
-            (daemon_type, daemon_id) = cmd.get('who', '').split('.')
-            result = CommandResult('')
-            self.send_command(result, daemon_type, daemon_id, json.dumps({
-                'prefix': 'smart',
-                'format': 'json',
-            }), '')
-            r, outb, outs = result.wait()
-            return r, outb, outs
-        elif cmd['prefix'] == 'device scrape-daemon-health-metrics':
-            who = cmd.get('who', '')
-            if not self.is_valid_daemon_name(who):
-                return -errno.EINVAL, '', 'not a valid mon or osd daemon name'
-            (daemon_type, daemon_id) = cmd.get('who', '').split('.')
-            return self.scrape_daemon(daemon_type, daemon_id)
-        elif cmd['prefix'] == 'device scrape-health-metrics':
-            if 'devid' in cmd:
-                return self.scrape_device(cmd['devid'])
+    @CLICommand('device query-daemon-health-metrics',
+                perm='r')
+    def do_query_daemon_health_metrics(self, who: str):
+        '''
+        Get device health metrics for a given daemon
+        '''
+        if not self.is_valid_daemon_name(who):
+            return -errno.EINVAL, '', 'not a valid mon or osd daemon name'
+        (daemon_type, daemon_id) = who.split('.')
+        result = CommandResult('')
+        self.send_command(result, daemon_type, daemon_id, json.dumps({
+            'prefix': 'smart',
+            'format': 'json',
+        }), '')
+        return result.wait()
+
+    @CLICommand('device scrape-daemon-health-metrics',
+                perm='r')
+    def do_scrape_daemon_health_metrics(self, who: str):
+        '''
+        Scrape and store device health metrics for a given daemon
+        '''
+        if not self.is_valid_daemon_name(who):
+            return -errno.EINVAL, '', 'not a valid mon or osd daemon name'
+        (daemon_type, daemon_id) = who.split('.')
+        return self.scrape_daemon(daemon_type, daemon_id)
+
+    @CLICommand('device scrape-daemon-health-metrics',
+                perm='r')
+    def do_scrape_health_metrics(self, devid: Optional[str] = None):
+        '''
+        Scrape and store device health metrics
+        '''
+        if devid is None:
             return self.scrape_all()
-        elif cmd['prefix'] == 'device get-health-metrics':
-            return self.show_device_metrics(cmd['devid'], cmd.get('sample'))
-        elif cmd['prefix'] == 'device check-health':
-            return self.check_health()
-        elif cmd['prefix'] == 'device monitoring on':
-            self.set_module_option('enable_monitoring', True)
-            self.event.set()
-            return 0, '', ''
-        elif cmd['prefix'] == 'device monitoring off':
-            self.set_module_option('enable_monitoring', False)
-            self.set_health_checks({})  # avoid stuck health alerts
-            return 0, '', ''
-        elif cmd['prefix'] == 'device predict-life-expectancy':
-            return self.predict_lift_expectancy(cmd['devid'])
         else:
-            # mgr should respect our self.COMMANDS and not call us for
-            # any prefix we don't advertise
-            raise NotImplementedError(cmd['prefix'])
+            return self.scrape_device(devid)
+
+    @CLICommand('device get-health-metrics',
+                perm='r')
+    def do_get_health_metrics(self, devid: str, sample: Optional[str] = None):
+        '''
+        Show stored device metrics for the device
+        '''
+        return self.show_device_metrics(devid, sample)
+
+    @CLICommand('device check-health',
+                perm='rw')
+    def do_check_health(self):
+        '''
+        Check life expectancy of devices
+        '''
+        return self.check_health()
+
+    @CLICommand('device monitoring on',
+                perm='rw')
+    def do_monitoring_on(self):
+        '''
+        Enable device health monitoring
+        '''
+        self.set_module_option('enable_monitoring', True)
+        self.event.set()
+
+    @CLICommand('device monitoring off',
+                perm='rw')
+    def do_monitoring_off(self):
+        '''
+        Disable device health monitoring
+        '''
+        self.set_module_option('enable_monitoring', False)
+        self.set_health_checks({})  # avoid stuck health alerts
+
+    @CLICommand('device predict-life-expectancy',
+                perm='r')
+    def do_predict_life_expectancy(self, devid: str):
+        '''
+        Predict life expectancy with local predictor
+        '''
+        return self.predict_lift_expectancy(devid)
 
     def self_test(self):
         self.config_notify()
@@ -220,6 +209,37 @@ class Module(MgrModule):
                     self.get_module_option(opt['name']))
             self.log.debug(' %s = %s', opt['name'], getattr(self, opt['name']))
 
+    def notify(self, notify_type, notify_id):
+        # create device_health_metrics pool if it doesn't exist
+        if notify_type == "osd_map" and self.enable_monitoring:
+            if not self.has_device_pool:
+                self.create_device_pool()
+                self.has_device_pool = True
+
+    def create_device_pool(self):
+        self.log.debug('create %s pool' % self.pool_name)
+        # create pool
+        result = CommandResult('')
+        self.send_command(result, 'mon', '', json.dumps({
+            'prefix': 'osd pool create',
+            'format': 'json',
+            'pool': self.pool_name,
+            'pg_num': 1,
+            'pg_num_min': 1,
+        }), '')
+        r, outb, outs = result.wait()
+        assert r == 0
+        # set pool application
+        result = CommandResult('')
+        self.send_command(result, 'mon', '', json.dumps({
+            'prefix': 'osd pool application enable',
+            'format': 'json',
+            'pool': self.pool_name,
+            'app': 'mgr_devicehealth',
+        }), '')
+        r, outb, outs = result.wait()
+        assert r == 0
+
     def serve(self):
         self.log.info("Starting")
         self.config_notify()
@@ -229,7 +249,7 @@ class Module(MgrModule):
         if ls:
             try:
                 last_scrape = datetime.strptime(ls, TIME_FORMAT)
-            except ValueError as e:
+            except ValueError:
                 pass
         self.log.debug('Last scrape %s', last_scrape)
 
@@ -243,7 +263,7 @@ class Module(MgrModule):
                     next_scrape = now
                 else:
                     # align to scrape interval
-                    scrape_frequency = int(self.scrape_frequency) or 86400
+                    scrape_frequency = self.scrape_frequency or 86400
                     seconds = (last_scrape - datetime.utcfromtimestamp(0)).total_seconds()
                     seconds -= seconds % scrape_frequency
                     seconds += scrape_frequency
@@ -262,7 +282,7 @@ class Module(MgrModule):
                     self.set_store('last_scrape', last_scrape.strftime(TIME_FORMAT))
 
             # sleep
-            sleep_interval = int(self.sleep_interval) or 60
+            sleep_interval = self.sleep_interval or 60
             self.log.debug('Sleeping for %d seconds', sleep_interval)
             ret = self.event.wait(sleep_interval)
             self.event.clear()
@@ -273,44 +293,23 @@ class Module(MgrModule):
         self.event.set()
 
     def open_connection(self, create_if_missing=True):
-        pools = self.rados.list_pools()
-        is_pool = False
-        for pool in pools:
-            if pool == self.pool_name:
-                is_pool = True
-                break
-        if not is_pool:
+        osdmap = self.get("osd_map")
+        assert osdmap is not None
+        if len(osdmap['osds']) == 0:
+            return None
+        if not self.has_device_pool:
             if not create_if_missing:
                 return None
-            self.log.debug('create %s pool' % self.pool_name)
-            # create pool
-            result = CommandResult('')
-            self.send_command(result, 'mon', '', json.dumps({
-                'prefix': 'osd pool create',
-                'format': 'json',
-                'pool': self.pool_name,
-                'pg_num': 1,
-                'pg_num_min': 1,
-            }), '')
-            r, outb, outs = result.wait()
-            assert r == 0
-
-            # set pool application
-            result = CommandResult('')
-            self.send_command(result, 'mon', '', json.dumps({
-                'prefix': 'osd pool application enable',
-                'format': 'json',
-                'pool': self.pool_name,
-                'app': 'mgr_devicehealth',
-            }), '')
-            r, outb, outs = result.wait()
-            assert r == 0
-
+            if self.enable_monitoring:
+                self.create_device_pool()
+                self.has_device_pool = True
         ioctx = self.rados.open_ioctx(self.pool_name)
         return ioctx
 
     def scrape_daemon(self, daemon_type, daemon_id):
         ioctx = self.open_connection()
+        if not ioctx:
+            return 0, "", ""
         raw_smart_data = self.do_scrape_daemon(daemon_type, daemon_id)
         if raw_smart_data:
             for device, raw_data in raw_smart_data.items():
@@ -324,6 +323,8 @@ class Module(MgrModule):
         osdmap = self.get("osd_map")
         assert osdmap is not None
         ioctx = self.open_connection()
+        if not ioctx:
+            return 0, "", ""
         did_device = {}
         ids = []
         for osd in osdmap['osds']:
@@ -356,6 +357,8 @@ class Module(MgrModule):
                     'device ' + devid + ' not claimed by any active daemons')
         (daemon_type, daemon_id) = daemons[0].split('.')
         ioctx = self.open_connection()
+        if not ioctx:
+            return 0, "", ""
         raw_smart_data = self.do_scrape_daemon(daemon_type, daemon_id,
                                                devid=devid)
         if raw_smart_data:
@@ -389,14 +392,15 @@ class Module(MgrModule):
     def put_device_metrics(self, ioctx, devid, data):
         assert devid
         old_key = datetime.utcnow() - timedelta(
-            seconds=int(self.retention_period))
+            seconds=self.retention_period)
         prune = old_key.strftime(TIME_FORMAT)
         self.log.debug('put_device_metrics device %s prune %s' %
                        (devid, prune))
         erase = []
         try:
             with rados.ReadOpCtx() as op:
-                omap_iter, ret = ioctx.get_omap_keys(op, "", MAX_SAMPLES)  # fixme
+                # FIXME
+                omap_iter, ret = ioctx.get_omap_keys(op, "", MAX_SAMPLES)
                 assert ret == 0
                 ioctx.operate_read_op(op, devid)
                 for key, _ in list(omap_iter):
@@ -465,8 +469,8 @@ class Module(MgrModule):
         self.log.info('Check health')
         config = self.get('config')
         min_in_ratio = float(config.get('mon_osd_min_in_ratio'))
-        mark_out_threshold_td = timedelta(seconds=int(self.mark_out_threshold))
-        warn_threshold_td = timedelta(seconds=int(self.warn_threshold))
+        mark_out_threshold_td = timedelta(seconds=self.mark_out_threshold)
+        warn_threshold_td = timedelta(seconds=self.warn_threshold)
         checks = {}
         health_warnings = {
             DEVICE_HEALTH: [],
@@ -594,7 +598,8 @@ class Module(MgrModule):
         }), '')
         r, outb, outs = result.wait()
         if r != 0:
-            self.log.warning('Could not mark OSD %s out. r: [%s], outb: [%s], outs: [%s]' % (osd_ids, r, outb, outs))
+            self.log.warning('Could not mark OSD %s out. r: [%s], outb: [%s], outs: [%s]',
+                             osd_ids, r, outb, outs)
         for osd_id in osd_ids:
             result = CommandResult('')
             self.send_command(result, 'mon', '', json.dumps({
@@ -605,7 +610,9 @@ class Module(MgrModule):
             }), '')
             r, outb, outs = result.wait()
             if r != 0:
-                self.log.warning('Could not set osd.%s primary-affinity, r: [%s], outs: [%s]' % (osd_id, r, outb, outs))
+                self.log.warning('Could not set osd.%s primary-affinity, '
+                                 'r: [%s], outb: [%s], outs: [%s]',
+                                 osd_id, r, outb, outs)
 
     def extract_smart_features(self, raw):
         # FIXME: extract and normalize raw smartctl --json output and
@@ -615,9 +622,7 @@ class Module(MgrModule):
     def predict_lift_expectancy(self, devid):
         plugin_name = ''
         model = self.get_ceph_option('device_failure_prediction_mode')
-        if model and model.lower() == 'cloud':
-            plugin_name = 'diskprediction_cloud'
-        elif model and model.lower() == 'local':
+        if model and model.lower() == 'local':
             plugin_name = 'diskprediction_local'
         else:
             return -1, '', 'unable to enable any disk prediction model[local/cloud]'
@@ -631,9 +636,7 @@ class Module(MgrModule):
     def predict_all_devices(self):
         plugin_name = ''
         model = self.get_ceph_option('device_failure_prediction_mode')
-        if model and model.lower() == 'cloud':
-            plugin_name = 'diskprediction_cloud'
-        elif model and model.lower() == 'local':
+        if model and model.lower() == 'local':
             plugin_name = 'diskprediction_local'
         else:
             return -1, '', 'unable to enable any disk prediction model[local/cloud]'

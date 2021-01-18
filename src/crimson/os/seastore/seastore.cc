@@ -15,7 +15,7 @@
 
 #include "crimson/os/futurized_collection.h"
 
-#include "crimson/os/seastore/segment_manager.h"
+#include "crimson/os/seastore/segment_manager/ephemeral.h"
 #include "crimson/os/seastore/transaction_manager.h"
 #include "crimson/os/seastore/onode_manager.h"
 #include "crimson/os/seastore/cache.h"
@@ -37,8 +37,11 @@ struct SeastoreCollection final : public FuturizedCollection {
 };
 
 SeaStore::SeaStore(const std::string& path)
-  : segment_manager(segment_manager::create_ephemeral(
-		      segment_manager::DEFAULT_TEST_EPHEMERAL)),
+  : segment_manager(segment_manager::create_test_ephemeral() /* TODO */),
+    segment_cleaner(
+      std::make_unique<SegmentCleaner>(
+	SegmentCleaner::config_t::default_from_segment_manager(
+	  *segment_manager))),
     cache(std::make_unique<Cache>(*segment_manager)),
     journal(new Journal(*segment_manager)),
     lba_manager(
@@ -46,11 +49,15 @@ SeaStore::SeaStore(const std::string& path)
     transaction_manager(
       new TransactionManager(
 	*segment_manager,
+	*segment_cleaner,
 	*journal,
 	*cache,
 	*lba_manager)),
     onode_manager(onode_manager::create_ephemeral())
-{}
+{
+  journal->set_segment_provider(&*segment_cleaner);
+  segment_cleaner->set_extent_callback(&*transaction_manager);
+}
 
 SeaStore::~SeaStore() = default;
 
@@ -163,10 +170,21 @@ seastar::future<struct stat> SeaStore::stat(
   return seastar::make_ready_future<struct stat>(st);
 }
 
-seastar::future<SeaStore::omap_values_t>
-SeaStore::omap_get_values(CollectionRef ch,
-                           const ghobject_t& oid,
-                           const omap_keys_t& keys)
+auto
+SeaStore::omap_get_header(
+  CollectionRef c,
+  const ghobject_t& oid)
+  -> read_errorator::future<bufferlist>
+{
+  return seastar::make_ready_future<bufferlist>();
+}
+
+auto
+SeaStore::omap_get_values(
+  CollectionRef ch,
+  const ghobject_t& oid,
+  const omap_keys_t& keys)
+  -> read_errorator::future<omap_values_t>
 {
   auto c = static_cast<SeastoreCollection*>(ch.get());
   logger().debug("{} {} {}",
@@ -174,20 +192,13 @@ SeaStore::omap_get_values(CollectionRef ch,
   return seastar::make_ready_future<omap_values_t>();
 }
 
-
-seastar::future<ceph::bufferlist> omap_get_header(
-  CollectionRef c,
-  const ghobject_t& oid)
-{
-  return seastar::make_ready_future<bufferlist>();
-}
-
-seastar::future<std::tuple<bool, SeaStore::omap_values_t>>
+auto
 SeaStore::omap_get_values(
-    CollectionRef ch,
-    const ghobject_t &oid,
-    const std::optional<string> &start
-  ) {
+  CollectionRef ch,
+  const ghobject_t &oid,
+  const std::optional<string> &start)
+  -> read_errorator::future<std::tuple<bool, SeaStore::omap_values_t>>
+{
   auto c = static_cast<SeastoreCollection*>(ch.get());
   logger().debug(
     "{} {} {}",

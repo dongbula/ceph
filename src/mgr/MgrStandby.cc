@@ -44,9 +44,8 @@ MgrStandby::MgrStandby(int argc, const char **argv) :
 		     cct->_conf.get_val<std::string>("ms_type"),
 		     entity_name_t::MGR(),
 		     "mgr",
-		     Messenger::get_pid_nonce(),
-		     0)),
-  objecter{g_ceph_context, client_messenger.get(), &monc, poolctx, 0, 0},
+		     Messenger::get_pid_nonce())),
+  objecter{g_ceph_context, client_messenger.get(), &monc, poolctx},
   client{client_messenger.get(), &monc, &objecter},
   mgrc(g_ceph_context, client_messenger.get(), &monc.monmap),
   log_client(g_ceph_context, client_messenger.get(), &monc.monmap, LogClient::NO_FLAGS),
@@ -133,7 +132,10 @@ int MgrStandby::init()
   // We must register our config callback before calling init(), so
   // that we see the initial configuration message
   monc.register_config_callback([this](const std::string &k, const std::string &v){
-      dout(10) << "config_callback: " << k << " : " << v << dendl;
+      // removing value to hide sensitive data going into mgr logs
+      // leaving this for debugging purposes
+      // dout(10) << "config_callback: " << k << " : " << v << dendl;
+      dout(10) << "config_callback: " << k << " : " << dendl;
       if (k.substr(0, 4) == "mgr/") {
 	const std::string global_key = PyModule::config_prefix + k.substr(4);
         py_module_registry.handle_config(global_key, v);
@@ -210,7 +212,7 @@ void MgrStandby::send_beacon()
 
   auto clients = py_module_registry.get_clients();
   for (const auto& client : clients) {
-    dout(15) << "noting RADOS client for blacklist: " << client << dendl;
+    dout(15) << "noting RADOS client for blocklist: " << client << dendl;
   }
 
   // Whether I think I am available (request MgrMonitor to set me
@@ -387,6 +389,7 @@ void MgrStandby::handle_mgr_map(ref_t<MMgrMap> mmap)
   // this MgrMap is changing its set of enabled modules
   bool need_respawn = py_module_registry.handle_mgr_map(map);
   if (need_respawn) {
+    dout(1) << "respawning because set of enabled modules changed!" << dendl;
     respawn();
   }
 

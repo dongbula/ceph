@@ -4,9 +4,8 @@
 #pragma once
 
 #include <string>
-#include <unordered_map>
 #include <map>
-#include <typeinfo>
+#include <optional>
 #include <vector>
 
 #include <seastar/core/future.hh>
@@ -28,21 +27,13 @@ class FuturizedStore {
 public:
   class OmapIterator {
   public:
-    virtual seastar::future<int> seek_to_first() {
-      return seastar::make_ready_future<int>(0);
-    }
-    virtual seastar::future<int> upper_bound(const std::string &after) {
-      return seastar::make_ready_future<int>(0);
-    }
-    virtual seastar::future<int> lower_bound(const std::string &to) {
-      return seastar::make_ready_future<int>(0);
-    }
+    virtual seastar::future<> seek_to_first() = 0;
+    virtual seastar::future<> upper_bound(const std::string &after) = 0;
+    virtual seastar::future<> lower_bound(const std::string &to) = 0;
     virtual bool valid() const {
       return false;
     }
-    virtual seastar::future<int> next() {
-      return seastar::make_ready_future<int>(0);
-    }
+    virtual seastar::future<> next() = 0;
     virtual std::string key() {
       return {};
     }
@@ -118,22 +109,22 @@ public:
 
   using omap_values_t = std::map<std::string, bufferlist, std::less<>>;
   using omap_keys_t = std::set<std::string>;
-  virtual seastar::future<omap_values_t> omap_get_values(
-                                         CollectionRef c,
-                                         const ghobject_t& oid,
-                                         const omap_keys_t& keys) = 0;
+  virtual read_errorator::future<omap_values_t> omap_get_values(
+    CollectionRef c,
+    const ghobject_t& oid,
+    const omap_keys_t& keys) = 0;
   virtual seastar::future<std::tuple<std::vector<ghobject_t>, ghobject_t>> list_objects(
     CollectionRef c,
     const ghobject_t& start,
     const ghobject_t& end,
     uint64_t limit) const = 0;
-  virtual seastar::future<std::tuple<bool, omap_values_t>> omap_get_values(
+  virtual read_errorator::future<std::tuple<bool, omap_values_t>> omap_get_values(
     CollectionRef c,           ///< [in] collection
     const ghobject_t &oid,     ///< [in] oid
     const std::optional<std::string> &start ///< [in] start, empty for begin
     ) = 0; ///< @return <done, values> values.empty() iff done
 
-  virtual seastar::future<bufferlist> omap_get_header(
+  virtual read_errorator::future<bufferlist> omap_get_header(
     CollectionRef c,
     const ghobject_t& oid) = 0;
 

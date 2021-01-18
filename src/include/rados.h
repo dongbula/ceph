@@ -90,6 +90,8 @@ struct ceph_pg {
  *
  * b <= bmask and bmask=(2**n)-1
  * e.g., b=12 -> bmask=15, b=123 -> bmask=127
+ *
+ * ** This function is released to the public domain by the author. **
  */
 static inline int ceph_stable_mod(int x, int b, int bmask)
 {
@@ -323,10 +325,11 @@ extern const char *ceph_osd_state_name(int s);
 									    \
 	/* Extensible */						    \
 	f(SET_REDIRECT,	__CEPH_OSD_OP(WR, DATA, 39),	"set-redirect")	    \
-	f(SET_CHUNK,	__CEPH_OSD_OP(WR, DATA, 40),	"set-chunk")	    \
+	f(SET_CHUNK,	__CEPH_OSD_OP(CACHE, DATA, 40),	"set-chunk")	    \
 	f(TIER_PROMOTE,	__CEPH_OSD_OP(WR, DATA, 41),	"tier-promote")	    \
 	f(UNSET_MANIFEST, __CEPH_OSD_OP(WR, DATA, 42),	"unset-manifest")   \
 	f(TIER_FLUSH, __CEPH_OSD_OP(CACHE, DATA, 43),	"tier-flush")	    \
+	f(TIER_EVICT, __CEPH_OSD_OP(CACHE, DATA, 44),	"tier-evict")	    \
 									    \
 	/** attrs **/							    \
 	/* read */							    \
@@ -487,7 +490,8 @@ enum {
 };
 
 #define EOLDSNAPC    85  /* ORDERSNAP flag set; writer has old snapc*/
-#define EBLACKLISTED 108 /* blacklisted */
+#define EBLOCKLISTED 108 /* blocklisted */
+#define EBLACKLISTED 108 /* deprecated */
 
 /* xattr comparison */
 enum {

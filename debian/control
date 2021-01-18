@@ -7,7 +7,9 @@ Vcs-Browser: https://github.com/ceph/ceph
 Maintainer: Ceph Maintainers <ceph-maintainers@lists.ceph.com>
 Uploaders: Ken Dreyer <kdreyer@redhat.com>,
            Alfredo Deza <adeza@redhat.com>,
-Build-Depends: cmake (>= 3.10.2),
+Build-Depends: automake,
+# Jaeger       bison,
+               cmake (>= 3.10.2),
                cpio,
                cryptsetup-bin | cryptsetup,
                cython,
@@ -17,6 +19,7 @@ Build-Depends: cmake (>= 3.10.2),
                dh-exec,
                dh-python,
                dh-systemd,
+# Jaeger       flex,
                git,
                gperf,
                g++ (>= 7),
@@ -29,10 +32,13 @@ Build-Depends: cmake (>= 3.10.2),
                libblkid-dev (>= 2.17),
 # Crimson      libc-ares-dev,
 # Crimson      libcrypto++-dev,
+               libcryptsetup-dev,
                libcap-ng-dev,
                libcunit1-dev,
                libcurl4-openssl-dev,
+# Jaeger       libevent-dev,
                libexpat1-dev,
+# Make-Check   libffi-dev [!amd64],
                libfuse-dev,
                libgoogle-perftools-dev [i386 amd64 arm64],
 # Crimson      libgnutls28-dev,
@@ -43,6 +49,7 @@ Build-Depends: cmake (>= 3.10.2),
                libldap2-dev,
                libleveldb-dev,
                liblttng-ust-dev,
+               liblua5.3-dev,
                liblz4-dev (>= 0.0~r131),
                libncurses-dev,
                libnss3-dev,
@@ -57,14 +64,16 @@ Build-Depends: cmake (>= 3.10.2),
                libudev-dev,
                libnl-genl-3-dev,
                libxml2-dev,
-# Crimson      libyaml-cpp-dev,
                librabbitmq-dev,
                librdkafka-dev,
+               luarocks,
 # Make-Check   libxmlsec1,
 # Make-Check   libxmlsec1-nss,
 # Make-Check   libxmlsec1-openssl,
 # Make-Check   libxmlsec1-dev,
+# Crimson      libyaml-cpp-dev,
                lsb-release,
+# Jaeger       nlohmann-json-dev | nlohmann-json3-dev,
                parted,
                patch,
                pkg-config,
@@ -96,8 +105,9 @@ Build-Depends: cmake (>= 3.10.2),
                xfslibs-dev,
 # Make-Check   xfsprogs,
 # Make-Check   xmlstarlet,
-               yasm [amd64],
+               nasm [amd64],
                zlib1g-dev,
+# Jaeger       Built-Using:   libyaml-cpp-dev (>= 0.6),
 Standards-Version: 4.4.0
 
 Package: ceph
@@ -215,6 +225,7 @@ Depends: ceph-base (= ${binary:Version}),
          ceph-mgr-modules-core (= ${binary:Version}),
          python3-bcrypt,
          python3-cherrypy3,
+         python3-distutils,
          python3-jwt,
          python3-openssl,
          python3-pecan,
@@ -225,7 +236,6 @@ Depends: ceph-base (= ${binary:Version}),
          ${shlibs:Depends},
 Recommends: ceph-mgr-dashboard,
             ceph-mgr-diskprediction-local,
-            ceph-mgr-diskprediction-cloud,
             ceph-mgr-k8sevents,
             ceph-mgr-cephadm
 Suggests: python3-influxdb
@@ -277,20 +287,6 @@ Description: diskprediction-local module for ceph-mgr
  block and file system storage.
  .
  This package contains the diskprediction_local module for the ceph-mgr
- daemon, which helps predict disk failures.
-
-Package: ceph-mgr-diskprediction-cloud
-Architecture: all
-Depends: ceph-mgr (= ${binary:Version}),
-         ${misc:Depends},
-         ${python:Depends},
-         ${shlibs:Depends},
-Description: diskprediction-cloud module for ceph-mgr
- Ceph is a massively scalable, open-source, distributed
- storage system that runs on commodity hardware and delivers object,
- block and file system storage.
- .
- This package contains the diskprediction_cloud module for the ceph-mgr
  daemon, which helps predict disk failures.
 
 Package: ceph-mgr-modules-core
@@ -375,10 +371,13 @@ Description: debugging symbols for ceph-mgr
 Package: ceph-mon
 Architecture: linux-any
 Depends: ceph-base (= ${binary:Version}),
+         libjaeger,
          ${misc:Depends},
          ${shlibs:Depends},
 Replaces: ceph (<< 10), ceph-test (<< 12.2.2-14)
 Breaks: ceph (<< 10), ceph-test (<< 12.2.2-14)
+Recommends: nvme-cli,
+            smartmontools,
 Description: monitor server for the ceph storage system
  Ceph is a massively scalable, open-source, distributed
  storage system that runs on commodity hardware and delivers object,
@@ -412,6 +411,8 @@ Depends: ceph-base (= ${binary:Version}),
          ${shlibs:Depends},
 Replaces: ceph (<< 10), ceph-test (<< 12.2.2-14)
 Breaks: ceph (<< 10), ceph-test (<< 12.2.2-14)
+Recommends: nvme-cli,
+            smartmontools,
 Description: OSD server for the ceph storage system
  Ceph is a massively scalable, open-source, distributed
  storage system that runs on commodity hardware and delivers object,
@@ -467,6 +468,30 @@ Description: debugging symbols for ceph-fuse
  root privileges.
  .
  This package contains the debugging symbols for ceph-fuse.
+
+Package: cephfs-mirror
+Architecture: linux-any
+Depends: ceph-common (= ${binary:Version}),
+         librados2 (= ${binary:Version}),
+         libcephfs2 (= ${binary:Version}),
+         ${misc:Depends},
+         ${shlibs:Depends},
+Description:  Ceph is a massively scalable, open-source, distributed
+ storage system that runs on commodity hardware and delivers object,
+ block and file system storage. This is a daemon for mirroring CephFS
+ directory snapshots between Ceph clusters.
+
+Package: cephfs-mirror-dbg
+Architecture: linux-any
+Section: debug
+Priority: extra
+Depends: cephfs-mirror (= ${binary:Version}),
+         ${misc:Depends}
+Description: debugging symbols for cephfs-mirror
+ Ceph is a massively scalable, open-source, distributed
+ storage system that runs on commodity hardware and delivers object,
+ block and file system storage.  This is a  daemon for mirroring CephFS
+ directory snapshots between Ceph clusters.
 
 Package: rbd-fuse
 Architecture: linux-any
@@ -579,7 +604,8 @@ Description: debugging symbols for rbd-nbd
 
 Package: ceph-common
 Architecture: linux-any
-Depends: librbd1 (= ${binary:Version}),
+Depends: libjaeger (= ${binary:Version}),
+         librbd1 (= ${binary:Version}),
          python3-cephfs (= ${binary:Version}),
          python3-ceph-argparse (= ${binary:Version}),
          python3-ceph-common (= ${binary:Version}),
@@ -916,6 +942,13 @@ Description: debugging symbols for radosgw
  .
  This package contains debugging symbols for radosgw.
 
+Package: libjaeger
+Architecture: linux-any
+Section: libs
+Depends: ${misc:Depends},
+         ${shlibs:Depends},
+Description: This package provides libraries needed for distributed tracing for Ceph.
+
 Package: ceph-test
 Architecture: linux-any
 Depends: ceph-common,
@@ -1150,6 +1183,15 @@ Description: interactive shell for the Ceph distributed file system
  a nice pseudo-shell which works like an FTP client.
  .
  This package contains a CLI for interacting with the CephFS.
+
+Package: cephfs-top
+Architecture: all
+Depends: ${misc:Depends}
+         ${python3:Depends}
+Description: This package provides a top(1) like utility to display various
+ filesystem metrics in realtime.
+ .
+ This package contains utility for displaying filesystem metrics.
 
 Package: ceph-grafana-dashboards
 Architecture: all

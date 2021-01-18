@@ -30,6 +30,7 @@
 #include "messages/MClientReclaimReply.h"
 #include "messages/MLock.h"
 
+#include "CInode.h"
 #include "MDSRank.h"
 #include "Mutation.h"
 #include "MDSContext.h"
@@ -78,6 +79,7 @@ enum {
   l_mdss_req_symlink_latency,
   l_mdss_req_unlink_latency,
   l_mdss_cap_revoke_eviction,
+  l_mdss_cap_acquisition_throttle,
   l_mdss_last,
 };
 
@@ -129,7 +131,7 @@ public:
   void terminate_sessions();
   void find_idle_sessions();
   void kill_session(Session *session, Context *on_safe, bool need_purge_inos = false);
-  size_t apply_blacklist(const std::set<entity_addr_t> &blacklist);
+  size_t apply_blocklist(const std::set<entity_addr_t> &blocklist);
   void journal_close_session(Session *session, int state, Context *on_safe, bool need_purge_inos = false);
 
   size_t get_num_pending_reclaim() const { return client_reclaim_gather.size(); }
@@ -234,7 +236,7 @@ public:
 
   // link
   void handle_client_link(MDRequestRef& mdr);
-  void _link_local(MDRequestRef& mdr, CDentry *dn, CInode *targeti);
+  void _link_local(MDRequestRef& mdr, CDentry *dn, CInode *targeti, SnapRealm *target_realm);
   void _link_local_finish(MDRequestRef& mdr, CDentry *dn, CInode *targeti,
 			  version_t, version_t, bool);
 
@@ -287,7 +289,8 @@ public:
   bool _need_force_journal(CInode *diri, bool empty);
   void _rename_prepare(MDRequestRef& mdr,
 		       EMetaBlob *metablob, bufferlist *client_map_bl,
-		       CDentry *srcdn, CDentry *destdn, CDentry *straydn);
+		       CDentry *srcdn, CDentry *destdn, std::string_view alternate_name,
+                       CDentry *straydn);
   /* set not_journaling=true if you're going to discard the results --
    * this bypasses the asserts to make sure we're journaling the right
    * things on the right nodes */
@@ -318,6 +321,113 @@ private:
   friend class ServerLogContext;
   friend class Batch_Getattr_Lookup;
 
+  // placeholder for validation handler to store xattr specific
+  // data
+  struct XattrInfo {
+    virtual ~XattrInfo() {
+    }
+  };
+
+  struct MirrorXattrInfo : XattrInfo {
+    std::string cluster_id;
+    std::string fs_id;
+
+    static const std::string MIRROR_INFO_REGEX;
+    static const std::string CLUSTER_ID;
+    static const std::string FS_ID;
+
+    MirrorXattrInfo(std::string_view cluster_id,
+                    std::string_view fs_id)
+      : cluster_id(cluster_id),
+        fs_id(fs_id) {
+    }
+  };
+
+  struct XattrOp {
+    int op;
+    std::string xattr_name;
+    const bufferlist &xattr_value;
+    int flags = 0;
+
+    std::unique_ptr<XattrInfo> xinfo;
+
+    XattrOp(int op, std::string_view xattr_name, const bufferlist &xattr_value, int flags)
+      : op(op),
+        xattr_name(xattr_name),
+        xattr_value(xattr_value),
+        flags (flags) {
+    }
+  };
+
+  struct XattrHandler {
+    const std::string xattr_name;
+    const std::string description;
+
+    // basic checks are to be done in this handler. return -errno to
+    // reject xattr request (set or remove), zero to proceed. handlers
+    // may parse xattr value for verification if needed and have an
+    // option to store custom data in XattrOp::xinfo.
+    int (Server::*validate)(CInode *cur, const InodeStoreBase::xattr_map_const_ptr xattrs,
+                            XattrOp *xattr_op);
+
+    // set xattr for an inode in xattr_map
+    void (Server::*setxattr)(CInode *cur, InodeStoreBase::xattr_map_ptr xattrs,
+                             const XattrOp &xattr_op);
+
+    // remove xattr for an inode from xattr_map
+    void (Server::*removexattr)(CInode *cur, InodeStoreBase::xattr_map_ptr xattrs,
+                                const XattrOp &xattr_op);
+  };
+
+  inline static const std::string DEFAULT_HANDLER = "<default>";
+  static const XattrHandler xattr_handlers[];
+
+  const XattrHandler* get_xattr_or_default_handler(std::string_view xattr_name);
+
+  // generic variant to set/remove xattr in/from xattr_map
+  int xattr_validate(CInode *cur, const InodeStoreBase::xattr_map_const_ptr xattrs,
+                     const std::string &xattr_name, int op, int flags);
+  void xattr_set(InodeStoreBase::xattr_map_ptr xattrs, const std::string &xattr_name,
+                 const bufferlist &xattr_value);
+  void xattr_rm(InodeStoreBase::xattr_map_ptr xattrs, const std::string &xattr_name);
+
+  // default xattr handlers
+  int default_xattr_validate(CInode *cur, const InodeStoreBase::xattr_map_const_ptr xattrs,
+                             XattrOp *xattr_op);
+  void default_setxattr_handler(CInode *cur, InodeStoreBase::xattr_map_ptr xattrs,
+                                const XattrOp &xattr_op);
+  void default_removexattr_handler(CInode *cur, InodeStoreBase::xattr_map_ptr xattrs,
+                                   const XattrOp &xattr_op);
+
+  // mirror info xattr handler
+  int parse_mirror_info_xattr(const std::string &name, const std::string &value,
+                              std::string &cluster_id, std::string &fs_id);
+  int mirror_info_xattr_validate(CInode *cur, const InodeStoreBase::xattr_map_const_ptr xattrs,
+                                 XattrOp *xattr_op);
+  void mirror_info_setxattr_handler(CInode *cur, InodeStoreBase::xattr_map_ptr xattrs,
+                                    const XattrOp &xattr_op);
+  void mirror_info_removexattr_handler(CInode *cur, InodeStoreBase::xattr_map_ptr xattrs,
+                                       const XattrOp &xattr_op);
+
+  static bool is_ceph_vxattr(std::string_view xattr_name) {
+    return xattr_name.rfind("ceph.dir.layout", 0) == 0 ||
+           xattr_name.rfind("ceph.file.layout", 0) == 0 ||
+           xattr_name.rfind("ceph.quota", 0) == 0 ||
+           xattr_name == "ceph.dir.subvolume"sv ||
+           xattr_name == "ceph.dir.pin"sv ||
+           xattr_name == "ceph.dir.pin.random"sv ||
+           xattr_name == "ceph.dir.pin.distributed"sv;
+  }
+
+  static bool is_allowed_ceph_xattr(std::string_view xattr_name) {
+    // not a ceph xattr -- allow!
+    if (xattr_name.rfind("ceph.", 0) != 0) {
+      return true;
+    }
+
+    return xattr_name == "ceph.mirror.info";
+  }
+
   void reply_client_request(MDRequestRef& mdr, const ref_t<MClientReply> &reply);
   void flush_session(Session *session, MDSGatherBuilder& gather);
 
@@ -342,6 +452,7 @@ private:
   feature_bitset_t supported_features;
   feature_bitset_t required_client_features;
 
+  bool forward_all_requests_to_auth = false;
   bool replay_unsafe_with_closed_session = false;
   double cap_revoke_eviction_timeout = 0;
   uint64_t max_snaps_per_dir = 100;
@@ -351,6 +462,14 @@ private:
   time last_recall_state;
 
   MetricsHandler *metrics_handler;
+
+  // Cache cap acquisition throttle configs
+  uint64_t max_caps_per_client;
+  uint64_t cap_acquisition_throttle;
+  double max_caps_throttle_ratio;
+  double caps_throttle_retry_request_timeout;
+
+  size_t alternate_name_max = g_conf().get_val<Option::size_t>("mds_alternate_name_max");
 };
 
 static inline constexpr auto operator|(Server::RecallFlags a, Server::RecallFlags b) {

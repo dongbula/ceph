@@ -1,9 +1,12 @@
 import os
+import sys
 import stat
 import uuid
 import errno
 import logging
+import json
 from datetime import datetime
+from typing import List, Dict
 
 import cephfs
 
@@ -13,9 +16,11 @@ from .op_sm import SubvolumeOpSm
 from .subvolume_base import SubvolumeBase
 from ..template import SubvolumeTemplate
 from ..snapshot_util import mksnap, rmsnap
+from ..access import allow_access, deny_access
 from ...exception import IndexException, OpSmException, VolumeException, MetadataMgrException
-from ...fs_util import listdir
+from ...fs_util import listsnaps, is_inherited_snap
 from ..template import SubvolumeOpType
+from ..group import Group
 
 from ..clone_index import open_clone_index, create_clone_index
 
@@ -54,6 +59,17 @@ class SubvolumeV1(SubvolumeBase, SubvolumeTemplate):
     def features(self):
         return [SubvolumeFeatures.FEATURE_SNAPSHOT_CLONE.value, SubvolumeFeatures.FEATURE_SNAPSHOT_AUTOPROTECT.value]
 
+    def mark_subvolume(self):
+        # set subvolume attr, on subvolume root, marking it as a CephFS subvolume
+        # subvolume root is where snapshots would be taken, and hence is the <uuid> dir for v1 subvolumes
+        try:
+            # MDS treats this as a noop for already marked subvolume
+            self.fs.setxattr(self.path, 'ceph.dir.subvolume', b'1', 0)
+        except cephfs.InvalidValue as e:
+            raise VolumeException(-errno.EINVAL, "invalid value specified for ceph.dir.subvolume")
+        except cephfs.Error as e:
+            raise VolumeException(-e.args[0], e.args[1])
+
     def snapshot_base_path(self):
         """ Base path for all snapshots """
         return os.path.join(self.path, self.vol_spec.snapshot_dir_prefix.encode('utf-8'))
@@ -77,7 +93,15 @@ class SubvolumeV1(SubvolumeBase, SubvolumeTemplate):
         try:
             # create directory and set attributes
             self.fs.mkdirs(subvol_path, mode)
-            self.set_attrs(subvol_path, size, isolate_nspace, pool, uid, gid)
+            self.mark_subvolume()
+            attrs = {
+                'uid': uid,
+                'gid': gid,
+                'data_pool': pool,
+                'pool_namespace': self.namespace if isolate_nspace else None,
+                'quota': size
+            }
+            self.set_attrs(subvol_path, attrs)
 
             # persist subvolume metadata
             qpath = subvol_path.decode('utf-8')
@@ -120,9 +144,19 @@ class SubvolumeV1(SubvolumeBase, SubvolumeTemplate):
 
         subvol_path = os.path.join(self.base_path, str(uuid.uuid4()).encode('utf-8'))
         try:
+            # source snapshot attrs are used to create clone subvolume.
+            # attributes of subvolume's content though, are synced during the cloning process.
+            attrs = source_subvolume.get_attrs(source_subvolume.snapshot_data_path(snapname))
+
+            # override snapshot pool setting, if one is provided for the clone
+            if pool is not None:
+                attrs["data_pool"] = pool
+                attrs["pool_namespace"] = None
+
             # create directory and set attributes
-            self.fs.mkdirs(subvol_path, source_subvolume.mode)
-            self.set_attrs(subvol_path, None, None, pool, source_subvolume.uid, source_subvolume.gid)
+            self.fs.mkdirs(subvol_path, attrs.get("mode"))
+            self.mark_subvolume()
+            self.set_attrs(subvol_path, attrs)
 
             # persist subvolume metadata and clone source
             qpath = subvol_path.decode('utf-8')
@@ -184,6 +218,8 @@ class SubvolumeV1(SubvolumeBase, SubvolumeTemplate):
             subvol_path = self.path
             log.debug("refreshed metadata, checking subvolume path '{0}'".format(subvol_path))
             st = self.fs.stat(subvol_path)
+            # unconditionally mark as subvolume, to handle pre-existing subvolumes without the mark
+            self.mark_subvolume()
 
             self.uid = int(st.st_uid)
             self.gid = int(st.st_gid)
@@ -197,6 +233,355 @@ class SubvolumeV1(SubvolumeBase, SubvolumeTemplate):
             raise VolumeException(-errno.ENOENT, "mount path missing for subvolume '{0}'".format(self.subvolname))
         except cephfs.Error as e:
             raise VolumeException(-e.args[0], e.args[1])
+
+    def _recover_auth_meta(self, auth_id, auth_meta):
+        """
+        Call me after locking the auth meta file.
+        """
+        remove_subvolumes = []
+
+        for subvol, subvol_data in auth_meta['subvolumes'].items():
+            if not subvol_data['dirty']:
+                continue
+
+            (group_name, subvol_name) = subvol.split('/')
+            group_name = group_name if group_name != 'None' else Group.NO_GROUP_NAME
+            access_level = subvol_data['access_level']
+
+            with self.auth_mdata_mgr.subvol_metadata_lock(group_name, subvol_name):
+                subvol_meta = self.auth_mdata_mgr.subvol_metadata_get(group_name, subvol_name)
+
+                # No SVMeta update indicates that there was no auth update
+                # in Ceph either. So it's safe to remove corresponding
+                # partial update in AMeta.
+                if not subvol_meta or auth_id not in subvol_meta['auths']:
+                    remove_subvolumes.append(subvol)
+                    continue
+
+                want_auth = {
+                    'access_level': access_level,
+                    'dirty': False,
+                }
+                # SVMeta update looks clean. Ceph auth update must have been
+                # clean. Update the dirty flag and continue
+                if subvol_meta['auths'][auth_id] == want_auth:
+                    auth_meta['subvolumes'][subvol]['dirty'] = False
+                    self.auth_mdata_mgr.auth_metadata_set(auth_id, auth_meta)
+                    continue
+
+                client_entity = "client.{0}".format(auth_id)
+                ret, out, err = self.mgr.mon_command(
+                    {
+                        'prefix': 'auth get',
+                        'entity': client_entity,
+                        'format': 'json'
+                    })
+                if ret == 0:
+                    existing_caps = json.loads(out)
+                elif ret == -errno.ENOENT:
+                    existing_caps = None
+                else:
+                    log.error(err)
+                    raise VolumeException(ret, err)
+
+                self._authorize_subvolume(auth_id, access_level, existing_caps)
+
+            # Recovered from partial auth updates for the auth ID's access
+            # to a subvolume.
+            auth_meta['subvolumes'][subvol]['dirty'] = False
+            self.auth_mdata_mgr.auth_metadata_set(auth_id, auth_meta)
+
+        for subvol in remove_subvolumes:
+            del auth_meta['subvolumes'][subvol]
+
+        if not auth_meta['subvolumes']:
+            # Clean up auth meta file
+            self.fs.unlink(self.auth_mdata_mgr._auth_metadata_path(auth_id))
+            return
+
+        # Recovered from all partial auth updates for the auth ID.
+        auth_meta['dirty'] = False
+        self.auth_mdata_mgr.auth_metadata_set(auth_id, auth_meta)
+
+    def authorize(self, auth_id, access_level, tenant_id=None, allow_existing_id=False):
+        """
+        Get-or-create a Ceph auth identity for `auth_id` and grant them access
+        to
+        :param auth_id:
+        :param access_level:
+        :param tenant_id: Optionally provide a stringizable object to
+                          restrict any created cephx IDs to other callers
+                          passing the same tenant ID.
+        :allow_existing_id: Optionally authorize existing auth-ids not
+                          created by ceph_volume_client.
+        :return:
+        """
+
+        with self.auth_mdata_mgr.auth_lock(auth_id):
+            client_entity = "client.{0}".format(auth_id)
+            ret, out, err = self.mgr.mon_command(
+                {
+                    'prefix': 'auth get',
+                    'entity': client_entity,
+                    'format': 'json'
+                })
+
+            if ret == 0:
+                existing_caps = json.loads(out)
+            elif ret == -errno.ENOENT:
+                existing_caps = None
+            else:
+                log.error(err)
+                raise VolumeException(ret, err)
+
+            # Existing meta, or None, to be updated
+            auth_meta = self.auth_mdata_mgr.auth_metadata_get(auth_id)
+
+            # subvolume data to be inserted
+            group_name = self.group.groupname if self.group.groupname != Group.NO_GROUP_NAME else None
+            group_subvol_id = "{0}/{1}".format(group_name, self.subvolname)
+            subvolume = {
+                group_subvol_id : {
+                    # The access level at which the auth_id is authorized to
+                    # access the volume.
+                    'access_level': access_level,
+                    'dirty': True,
+                }
+            }
+
+            if auth_meta is None:
+                if not allow_existing_id and existing_caps is not None:
+                    msg = "auth ID: {0} exists and not created by mgr plugin. Not allowed to modify".format(auth_id)
+                    log.error(msg)
+                    raise VolumeException(-errno.EPERM, msg)
+
+                # non-existent auth IDs
+                sys.stderr.write("Creating meta for ID {0} with tenant {1}\n".format(
+                    auth_id, tenant_id
+                ))
+                log.debug("Authorize: no existing meta")
+                auth_meta = {
+                    'dirty': True,
+                    'tenant_id': str(tenant_id) if tenant_id else None,
+                    'subvolumes': subvolume
+                }
+            else:
+                # Update 'volumes' key (old style auth metadata file) to 'subvolumes' key
+                if 'volumes' in auth_meta:
+                    auth_meta['subvolumes'] = auth_meta.pop('volumes')
+
+                # Disallow tenants to share auth IDs
+                if str(auth_meta['tenant_id']) != str(tenant_id):
+                    msg = "auth ID: {0} is already in use".format(auth_id)
+                    log.error(msg)
+                    raise VolumeException(-errno.EPERM, msg)
+
+                if auth_meta['dirty']:
+                    self._recover_auth_meta(auth_id, auth_meta)
+
+                log.debug("Authorize: existing tenant {tenant}".format(
+                    tenant=auth_meta['tenant_id']
+                ))
+                auth_meta['dirty'] = True
+                auth_meta['subvolumes'].update(subvolume)
+
+            self.auth_mdata_mgr.auth_metadata_set(auth_id, auth_meta)
+
+            with self.auth_mdata_mgr.subvol_metadata_lock(self.group.groupname, self.subvolname):
+                key = self._authorize_subvolume(auth_id, access_level, existing_caps)
+
+            auth_meta['dirty'] = False
+            auth_meta['subvolumes'][group_subvol_id]['dirty'] = False
+            self.auth_mdata_mgr.auth_metadata_set(auth_id, auth_meta)
+
+            if tenant_id:
+                return key
+            else:
+                # Caller wasn't multi-tenant aware: be safe and don't give
+                # them a key
+                return ""
+
+    def _authorize_subvolume(self, auth_id, access_level, existing_caps):
+        subvol_meta = self.auth_mdata_mgr.subvol_metadata_get(self.group.groupname, self.subvolname)
+
+        auth = {
+            auth_id: {
+                'access_level': access_level,
+                'dirty': True,
+            }
+        }
+
+        if subvol_meta is None:
+            subvol_meta = {
+                'auths': auth
+            }
+        else:
+            subvol_meta['auths'].update(auth)
+            self.auth_mdata_mgr.subvol_metadata_set(self.group.groupname, self.subvolname, subvol_meta)
+
+        key = self._authorize(auth_id, access_level, existing_caps)
+
+        subvol_meta['auths'][auth_id]['dirty'] = False
+        self.auth_mdata_mgr.subvol_metadata_set(self.group.groupname, self.subvolname, subvol_meta)
+
+        return key
+
+    def _authorize(self, auth_id, access_level, existing_caps):
+        subvol_path = self.path
+        log.debug("Authorizing Ceph id '{0}' for path '{1}'".format(auth_id, subvol_path))
+
+        # First I need to work out what the data pool is for this share:
+        # read the layout
+        try:
+            pool = self.fs.getxattr(subvol_path, 'ceph.dir.layout.pool').decode('utf-8')
+        except cephfs.Error as e:
+            raise VolumeException(-e.args[0], e.args[1])
+
+        try:
+            namespace = self.fs.getxattr(subvol_path, 'ceph.dir.layout.pool_namespace').decode('utf-8')
+        except cephfs.NoData:
+            namespace = None
+
+        # Now construct auth capabilities that give the guest just enough
+        # permissions to access the share
+        client_entity = "client.{0}".format(auth_id)
+        want_mds_cap = "allow {0} path={1}".format(access_level, subvol_path.decode('utf-8'))
+        want_osd_cap = "allow {0} pool={1}{2}".format(
+                access_level, pool, " namespace={0}".format(namespace) if namespace else "")
+
+        # Construct auth caps that if present might conflict with the desired
+        # auth caps.
+        unwanted_access_level = 'r' if access_level == 'rw' else 'rw'
+        unwanted_mds_cap = 'allow {0} path={1}'.format(unwanted_access_level, subvol_path.decode('utf-8'))
+        unwanted_osd_cap = "allow {0} pool={1}{2}".format(
+                unwanted_access_level, pool, " namespace={0}".format(namespace) if namespace else "")
+
+        return allow_access(self.mgr, client_entity, want_mds_cap, want_osd_cap,
+                            unwanted_mds_cap, unwanted_osd_cap, existing_caps)
+
+    def deauthorize(self, auth_id):
+        with self.auth_mdata_mgr.auth_lock(auth_id):
+            # Existing meta, or None, to be updated
+            auth_meta = self.auth_mdata_mgr.auth_metadata_get(auth_id)
+
+            if auth_meta is None:
+                msg = "auth ID: {0} doesn't exist".format(auth_id)
+                log.error(msg)
+                raise VolumeException(-errno.ENOENT, msg)
+
+            # Update 'volumes' key (old style auth metadata file) to 'subvolumes' key
+            if 'volumes' in auth_meta:
+                auth_meta['subvolumes'] = auth_meta.pop('volumes')
+
+            group_name = self.group.groupname if self.group.groupname != Group.NO_GROUP_NAME else None
+            group_subvol_id = "{0}/{1}".format(group_name, self.subvolname)
+            if (auth_meta is None) or (not auth_meta['subvolumes']):
+                log.warning("deauthorized called for already-removed auth"
+                         "ID '{auth_id}' for subvolume '{subvolume}'".format(
+                    auth_id=auth_id, subvolume=self.subvolname
+                ))
+                # Clean up the auth meta file of an auth ID
+                self.fs.unlink(self.auth_mdata_mgr._auth_metadata_path(auth_id))
+                return
+
+            if group_subvol_id not in auth_meta['subvolumes']:
+                log.warning("deauthorized called for already-removed auth"
+                         "ID '{auth_id}' for subvolume '{subvolume}'".format(
+                    auth_id=auth_id, subvolume=self.subvolname
+                ))
+                return
+
+            if auth_meta['dirty']:
+                self._recover_auth_meta(auth_id, auth_meta)
+
+            auth_meta['dirty'] = True
+            auth_meta['subvolumes'][group_subvol_id]['dirty'] = True
+            self.auth_mdata_mgr.auth_metadata_set(auth_id, auth_meta)
+
+            self._deauthorize_subvolume(auth_id)
+
+            # Filter out the volume we're deauthorizing
+            del auth_meta['subvolumes'][group_subvol_id]
+
+            # Clean up auth meta file
+            if not auth_meta['subvolumes']:
+                self.fs.unlink(self.auth_mdata_mgr._auth_metadata_path(auth_id))
+                return
+
+            auth_meta['dirty'] = False
+            self.auth_mdata_mgr.auth_metadata_set(auth_id, auth_meta)
+
+    def _deauthorize_subvolume(self, auth_id):
+        with self.auth_mdata_mgr.subvol_metadata_lock(self.group.groupname, self.subvolname):
+            subvol_meta = self.auth_mdata_mgr.subvol_metadata_get(self.group.groupname, self.subvolname)
+
+            if (subvol_meta is None) or (auth_id not in subvol_meta['auths']):
+                log.warning("deauthorized called for already-removed auth"
+                         "ID '{auth_id}' for subvolume '{subvolume}'".format(
+                    auth_id=auth_id, subvolume=self.subvolname
+                ))
+                return
+
+            subvol_meta['auths'][auth_id]['dirty'] = True
+            self.auth_mdata_mgr.subvol_metadata_set(self.group.groupname, self.subvolname, subvol_meta)
+
+            self._deauthorize(auth_id)
+
+            # Remove the auth_id from the metadata *after* removing it
+            # from ceph, so that if we crashed here, we would actually
+            # recreate the auth ID during recovery (i.e. end up with
+            # a consistent state).
+
+            # Filter out the auth we're removing
+            del subvol_meta['auths'][auth_id]
+            self.auth_mdata_mgr.subvol_metadata_set(self.group.groupname, self.subvolname, subvol_meta)
+
+    def _deauthorize(self, auth_id):
+        """
+        The volume must still exist.
+        """
+        client_entity = "client.{0}".format(auth_id)
+        subvol_path = self.path
+        try:
+            pool_name = self.fs.getxattr(subvol_path, 'ceph.dir.layout.pool').decode('utf-8')
+        except cephfs.Error as e:
+            raise VolumeException(-e.args[0], e.args[1])
+
+        try:
+            namespace = self.fs.getxattr(subvol_path, 'ceph.dir.layout.pool_namespace').decode('utf-8')
+        except cephfs.NoData:
+            namespace = None
+
+        # The auth_id might have read-only or read-write mount access for the
+        # subvolume path.
+        access_levels = ('r', 'rw')
+        want_mds_caps = ['allow {0} path={1}'.format(access_level, subvol_path.decode('utf-8'))
+                         for access_level in access_levels]
+        want_osd_caps = ['allow {0} pool={1}{2}'.format(
+                          access_level, pool_name, " namespace={0}".format(namespace) if namespace else "")
+                         for access_level in access_levels]
+        deny_access(self.mgr, client_entity, want_mds_caps, want_osd_caps)
+
+    def authorized_list(self):
+        """
+        Expose a list of auth IDs that have access to a subvolume.
+
+        return: a list of (auth_id, access_level) tuples, where
+                the access_level can be 'r' , or 'rw'.
+                None if no auth ID is given access to the subvolume.
+        """
+        with self.auth_mdata_mgr.subvol_metadata_lock(self.group.groupname, self.subvolname):
+            meta = self.auth_mdata_mgr.subvol_metadata_get(self.group.groupname, self.subvolname)
+            auths = [] # type: List[Dict[str,str]]
+            if not meta or not meta['auths']:
+                return auths
+
+            for auth, auth_data in meta['auths'].items():
+                # Skip partial auth updates.
+                if not auth_data['dirty']:
+                    auths.append({auth: auth_data['access_level']})
+
+            return auths
 
     def _get_clone_source(self):
         try:
@@ -252,8 +637,19 @@ class SubvolumeV1(SubvolumeBase, SubvolumeTemplate):
         return self._resize(subvol_path, newsize, noshrink)
 
     def create_snapshot(self, snapname):
-        snappath = self.snapshot_path(snapname)
-        mksnap(self.fs, snappath)
+        try:
+            group_snapshot_path = os.path.join(self.group.path,
+                                               self.vol_spec.snapshot_dir_prefix.encode('utf-8'),
+                                               snapname.encode('utf-8'))
+            self.fs.stat(group_snapshot_path)
+        except cephfs.Error as e:
+            if e.args[0] == errno.ENOENT:
+                snappath = self.snapshot_path(snapname)
+                mksnap(self.fs, snappath)
+            else:
+                raise VolumeException(-e.args[0], e.args[1])
+        else:
+            raise VolumeException(-errno.EINVAL, "subvolumegroup and subvolume snapshot name can't be same")
 
     def has_pending_clones(self, snapname):
         try:
@@ -270,6 +666,9 @@ class SubvolumeV1(SubvolumeBase, SubvolumeTemplate):
         rmsnap(self.fs, snappath)
 
     def snapshot_info(self, snapname):
+        if is_inherited_snap(snapname):
+            raise VolumeException(-errno.EINVAL,
+                                  "snapshot name '{0}' is invalid".format(snapname))
         snappath = self.snapshot_data_path(snapname)
         snap_info = {}
         try:
@@ -290,7 +689,7 @@ class SubvolumeV1(SubvolumeBase, SubvolumeTemplate):
     def list_snapshots(self):
         try:
             dirpath = self.snapshot_base_path()
-            return listdir(self.fs, dirpath)
+            return listsnaps(self.fs, self.vol_spec, dirpath, filter_inherited_snaps=True)
         except VolumeException as ve:
             if ve.errno == -errno.ENOENT:
                 return []

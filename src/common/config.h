@@ -100,7 +100,7 @@ public:
   std::map<std::string,std::string> ignored_mon_values;
 
   /// original raw values saved that may need to re-expand at certain time
-  mutable std::map<std::string, std::string> may_reexpand_meta;
+  mutable std::vector<std::string> may_reexpand_meta;
 
   /// encoded, cached copy of of values + ignored_mon_values
   ceph::bufferlist values_bl;
@@ -121,7 +121,10 @@ public:
   int parse_config_files(ConfigValues& values, const ConfigTracker& tracker,
 			 const char *conf_files,
 			 std::ostream *warnings, int flags);
-
+  int parse_buffer(ConfigValues& values, const ConfigTracker& tracker,
+		   const char* buf, size_t len,
+		   std::ostream *warnings);
+  void update_legacy_vals(ConfigValues& values);
   // Absorb config settings from the environment
   void parse_env(unsigned entity_type,
 		 ConfigValues& values, const ConfigTracker& tracker,
@@ -292,7 +295,6 @@ private:
   void assign_member(member_ptr_t ptr, const Option::value_t &val);
 
 
-  void update_legacy_vals(ConfigValues& values);
   void update_legacy_val(ConfigValues& values,
 			 const Option &opt,
 			 member_ptr_t member);
@@ -312,11 +314,12 @@ public:  // for global_init
   // for those want to reexpand special meta, e.g, $pid
   bool finalize_reexpand_meta(ConfigValues& values,
 			      const ConfigTracker& tracker);
-private:
+
   std::list<std::string> get_conffile_paths(const ConfigValues& values,
 					    const char *conf_files,
 					    std::ostream *warnings,
 					    int flags) const;
+private:
   static std::string get_cluster_name(const char* conffile_path);
   // The configuration file we read, or NULL if we haven't read one.
   ConfFile cf;

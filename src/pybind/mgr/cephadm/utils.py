@@ -1,9 +1,9 @@
 import logging
-import re
 import json
+import socket
 from enum import Enum
 from functools import wraps
-from typing import Optional, Callable, TypeVar, List, NewType, TYPE_CHECKING
+from typing import Optional, Callable, TypeVar, List, NewType, TYPE_CHECKING, Any, NamedTuple
 from orchestrator import OrchestratorError
 
 if TYPE_CHECKING:
@@ -13,15 +13,25 @@ T = TypeVar('T')
 logger = logging.getLogger(__name__)
 
 ConfEntity = NewType('ConfEntity', str)
-AuthEntity = NewType('AuthEntity', str)
 
 
 class CephadmNoImage(Enum):
     token = 1
 
 
+# ceph daemon types that use the ceph container image.
+# NOTE: listed in upgrade order!
+CEPH_UPGRADE_ORDER = ['mgr', 'mon', 'crash', 'osd', 'mds', 'rgw', 'rbd-mirror']
+
+
 # Used for _run_cephadm used for check-host etc that don't require an --image parameter
 cephadmNoImage = CephadmNoImage.token
+
+
+class ContainerInspectInfo(NamedTuple):
+    image_id: str
+    ceph_version: Optional[str]
+    repo_digest: Optional[str]
 
 
 def name_to_config_section(name: str) -> ConfEntity:
@@ -37,32 +47,9 @@ def name_to_config_section(name: str) -> ConfEntity:
         return ConfEntity('mon')
 
 
-def name_to_auth_entity(daemon_type: str,
-                        daemon_id: str,
-                        host: str = "",
-                        ) -> AuthEntity:
-    """
-    Map from daemon names/host to ceph entity names (as seen in config)
-    """
-    if daemon_type in ['rgw', 'rbd-mirror', 'nfs', "iscsi"]:
-        return AuthEntity('client.' + daemon_type + "." + daemon_id)
-    elif daemon_type == 'crash':
-        if host == "":
-            raise OrchestratorError("Host not provided to generate <crash> auth entity name")
-        return AuthEntity('client.' + daemon_type + "." + host)
-    elif daemon_type == 'mon':
-        return AuthEntity('mon.')
-    elif daemon_type == 'mgr':
-        return AuthEntity(daemon_type + "." + daemon_id)
-    elif daemon_type in ['osd', 'mds', 'client']:
-        return AuthEntity(daemon_type + "." + daemon_id)
-    else:
-        raise OrchestratorError("unknown auth entity name")
-
-
 def forall_hosts(f: Callable[..., T]) -> Callable[..., List[T]]:
     @wraps(f)
-    def forall_hosts_wrapper(*args) -> List[T]:
+    def forall_hosts_wrapper(*args: Any) -> List[T]:
         from cephadm.module import CephadmOrchestrator
 
         # Some weired logic to make calling functions with multiple arguments work.
@@ -74,7 +61,7 @@ def forall_hosts(f: Callable[..., T]) -> Callable[..., List[T]]:
         else:
             assert 'either f([...]) or self.f([...])'
 
-        def do_work(arg):
+        def do_work(arg: Any) -> T:
             if not isinstance(arg, tuple):
                 arg = (arg, )
             try:
@@ -99,7 +86,23 @@ def get_cluster_health(mgr: 'CephadmOrchestrator') -> str:
     })
     try:
         j = json.loads(out)
-    except Exception as e:
+    except ValueError:
+        msg = 'Failed to parse health status: Cannot decode JSON'
+        logger.exception('%s: \'%s\'' % (msg, out))
         raise OrchestratorError('failed to parse health status')
 
     return j['status']
+
+
+def is_repo_digest(image_name: str) -> bool:
+    """
+    repo digest are something like "ceph/ceph@sha256:blablabla"
+    """
+    return '@' in image_name
+
+
+def resolve_ip(hostname: str) -> str:
+    try:
+        return socket.getaddrinfo(hostname, None, flags=socket.AI_CANONNAME, type=socket.SOCK_STREAM)[0][4][0]
+    except socket.gaierror as e:
+        raise OrchestratorError(f"Cannot resolve ip for host {hostname}: {e}")

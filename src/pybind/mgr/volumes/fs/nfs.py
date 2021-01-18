@@ -13,22 +13,24 @@ import orchestrator
 from .fs_util import create_pool
 
 log = logging.getLogger(__name__)
+POOL_NAME = 'nfs-ganesha'
 
 
 def available_clusters(mgr):
     '''
     This method returns list of available cluster ids.
-    It removes 'ganesha-' prefixes from cluster service id returned by cephadm.
+    Service name is service_type.service_id
     Example:
     completion.result value:
-    <ServiceDescription of <NFSServiceSpec for service_name=nfs.ganesha-vstart>>
-    return value: ['ganesha-vstart'] -> ['vstart']
+    <ServiceDescription of <NFSServiceSpec for service_name=nfs.vstart>>
+    return value: ['vstart']
     '''
     # TODO check cephadm cluster list with rados pool conf objects
     completion = mgr.describe_service(service_type='nfs')
     mgr._orchestrator_wait([completion])
     orchestrator.raise_if_exception(completion)
-    return [cluster.spec.service_id.replace('ganesha-', '', 1) for cluster in completion.result]
+    return [cluster.spec.service_id for cluster in completion.result
+            if cluster.spec.service_id]
 
 
 def export_cluster_checker(func):
@@ -290,6 +292,63 @@ class Client(object):
         }
 
 
+class NFSRados:
+    def __init__(self, mgr, namespace):
+        self.mgr = mgr
+        self.pool = POOL_NAME
+        self.namespace = namespace
+
+    def _make_rados_url(self, obj):
+        return "rados://{}/{}/{}".format(self.pool, self.namespace, obj)
+
+    def _create_url_block(self, obj_name):
+        return {'block_name': '%url', 'value': self._make_rados_url(obj_name)}
+
+    def write_obj(self, conf_block, obj, config_obj=''):
+        if 'export-' in obj:
+            conf_block = GaneshaConfParser.write_block(conf_block)
+
+        with self.mgr.rados.open_ioctx(self.pool) as ioctx:
+            ioctx.set_namespace(self.namespace)
+            ioctx.write_full(obj, conf_block.encode('utf-8'))
+            if not config_obj:
+                # Return after creating empty common config object
+                return
+            log.debug("write configuration into rados object "
+                      f"{self.pool}/{self.namespace}/{obj}:\n{conf_block}")
+
+            # Add created obj url to common config obj
+            ioctx.append(config_obj, GaneshaConfParser.write_block(
+                         self._create_url_block(obj)).encode('utf-8'))
+            FSExport._check_rados_notify(ioctx, config_obj)
+            log.debug(f"Added {obj} url to {config_obj}")
+
+    def remove_obj(self, obj, config_obj):
+        with self.mgr.rados.open_ioctx(self.pool) as ioctx:
+            ioctx.set_namespace(self.namespace)
+            export_urls = ioctx.read(config_obj)
+            url = '%url "{}"\n\n'.format(self._make_rados_url(obj))
+            export_urls = export_urls.replace(url.encode('utf-8'), b'')
+            ioctx.remove_object(obj)
+            ioctx.write_full(config_obj, export_urls)
+            FSExport._check_rados_notify(ioctx, config_obj)
+            log.debug("Object deleted: {}".format(url))
+
+    def remove_all_obj(self):
+        with self.mgr.rados.open_ioctx(self.pool) as ioctx:
+            ioctx.set_namespace(self.namespace)
+            for obj in ioctx.list_objects():
+                obj.remove()
+
+    def check_user_config(self):
+        with self.mgr.rados.open_ioctx(self.pool) as ioctx:
+            ioctx.set_namespace(self.namespace)
+            for obj in ioctx.list_objects():
+                if obj.key.startswith("userconf-nfs"):
+                    return True
+        return False
+
+
 class Export(object):
     # pylint: disable=R0902
     def __init__(self, export_id, path, fsal, cluster_id, pseudo,
@@ -374,7 +433,7 @@ class Export(object):
 class FSExport(object):
     def __init__(self, mgr, namespace=None):
         self.mgr = mgr
-        self.rados_pool = 'nfs-ganesha'
+        self.rados_pool = POOL_NAME
         self.rados_namespace = namespace
         self._exports = None
 
@@ -451,47 +510,10 @@ class FSExport(object):
                     self.export_conf_objs.append(Export.from_export_block(
                         GaneshaConfParser(raw_config).parse()[0], rados_namespace))
 
-    def _write_raw_config(self, conf_block, obj, append=False):
-        raw_config = GaneshaConfParser.write_block(conf_block)
-        with self.mgr.rados.open_ioctx(self.rados_pool) as ioctx:
-            if self.rados_namespace:
-                ioctx.set_namespace(self.rados_namespace)
-            if append:
-                ioctx.append(obj, raw_config.encode('utf-8'))
-                FSExport._check_rados_notify(ioctx, obj)
-            else:
-                ioctx.write_full(obj, raw_config.encode('utf-8'))
-            log.debug("write configuration into rados object "
-                      f"{self.rados_pool}/{self.rados_namespace}/{obj}:\n{raw_config}")
-
-    def _make_rados_url(self, obj):
-        return "rados://{}/{}/{}".format(self.rados_pool, self.rados_namespace, obj)
-
-    def _delete_export_url(self, obj, ex_id):
-        export_name = 'export-{}'.format(ex_id)
-        with self.mgr.rados.open_ioctx(self.rados_pool) as ioctx:
-            ioctx.set_namespace(self.rados_namespace)
-            export_urls = ioctx.read(obj)
-            url = '%url "{}"\n\n'.format(self._make_rados_url(export_name))
-            export_urls = export_urls.replace(url.encode('utf-8'), b'')
-            ioctx.remove_object(export_name)
-            ioctx.write_full(obj, export_urls)
-            FSExport._check_rados_notify(ioctx, obj)
-            log.debug("Export deleted: {}".format(url))
-
-    def _update_common_conf(self, cluster_id, ex_id):
-        common_conf = 'conf-nfs.ganesha-{}'.format(cluster_id)
-        conf_blocks = {
-                'block_name': '%url',
-                'value': self._make_rados_url('export-{}'.format(ex_id))
-                }
-        self._write_raw_config(conf_blocks, common_conf, True)
-
     def _save_export(self, export):
         self.exports[self.rados_namespace].append(export)
-        conf_block = export.to_export_block()
-        self._write_raw_config(conf_block, "export-{}".format(export.export_id))
-        self._update_common_conf(export.cluster_id, export.export_id)
+        NFSRados(self.mgr, self.rados_namespace).write_obj(export.to_export_block(),
+                 f'export-{export.export_id}', f'conf-nfs.{export.cluster_id}')
 
     def _delete_export(self, cluster_id, pseudo_path, export_obj=None):
         try:
@@ -501,8 +523,9 @@ class FSExport(object):
                 export = self._fetch_export(pseudo_path)
 
             if export:
-                common_conf = 'conf-nfs.ganesha-{}'.format(cluster_id)
-                self._delete_export_url(common_conf, export.export_id)
+                if pseudo_path:
+                    NFSRados(self.mgr, self.rados_namespace).remove_obj(
+                             f'export-{export.export_id}', f'conf-nfs.{cluster_id}')
                 self.exports[cluster_id].remove(export)
                 self._delete_user(export.fsal.user_id)
                 if not self.exports[cluster_id]:
@@ -533,7 +556,7 @@ class FSExport(object):
             pseudo_path = self.format_path(pseudo_path)
             if not isabs(pseudo_path) or pseudo_path == "/":
                 return -errno.EINVAL, "", f"pseudo path {pseudo_path} is invalid. "\
-                        "It should not be absolute path or just '/'."
+                        "It should be an absolute path and it cannot be just '/'."
 
             if cluster_id not in self.exports:
                 self.exports[cluster_id] = []
@@ -618,18 +641,21 @@ class FSExport(object):
 
 class NFSCluster:
     def __init__(self, mgr):
-        self.pool_name = 'nfs-ganesha'
+        self.pool_name = POOL_NAME
         self.pool_ns = ''
         self.mgr = mgr
 
     def _set_cluster_id(self, cluster_id):
-        self.cluster_id = f"ganesha-{cluster_id}"
+        self.cluster_id = cluster_id
 
     def _set_pool_namespace(self, cluster_id):
         self.pool_ns = cluster_id
 
     def _get_common_conf_obj_name(self):
-        return 'conf-nfs.{}'.format(self.cluster_id)
+        return f'conf-nfs.{self.cluster_id}'
+
+    def _get_user_conf_obj_name(self):
+        return f'userconf-nfs.{self.cluster_id}'
 
     def _call_orch_apply_nfs(self, placement):
         spec = NFSServiceSpec(service_type='nfs', service_id=self.cluster_id,
@@ -641,19 +667,19 @@ class NFSCluster:
 
     def create_empty_rados_obj(self):
         common_conf = self._get_common_conf_obj_name()
-        result = ''
-        with self.mgr.rados.open_ioctx(self.pool_name) as ioctx:
-            ioctx.set_namespace(self.pool_ns)
-            ioctx.write_full(common_conf, result.encode('utf-8'))
-            log.debug("write configuration into rados object "
-                      f"{self.pool_name}/{self.pool_ns}/{common_conf}\n")
+        NFSRados(self.mgr, self.pool_ns).write_obj('', self._get_common_conf_obj_name())
+        log.info(f"Created empty object:{common_conf}")
 
-    def delete_common_config_obj(self):
-        common_conf = self._get_common_conf_obj_name()
-        with self.mgr.rados.open_ioctx(self.pool_name) as ioctx:
-            ioctx.set_namespace(self.pool_ns)
-            ioctx.remove_object(common_conf)
-            log.info(f"Deleted object:{common_conf}")
+    def delete_config_obj(self):
+        NFSRados(self.mgr, self.pool_ns).remove_all_obj()
+        log.info(f"Deleted {self._get_common_conf_obj_name()} object and all objects in "
+                 f"{self.pool_ns}")
+
+    def _restart_nfs_service(self):
+        completion = self.mgr.service_action(action='restart',
+                                             service_name='nfs.'+self.cluster_id)
+        self.mgr._orchestrator_wait([completion])
+        orchestrator.raise_if_exception(completion)
 
     @cluster_setter
     def create_nfs_cluster(self, export_type, cluster_id, placement):
@@ -701,8 +727,7 @@ class NFSCluster:
                 completion = self.mgr.remove_service('nfs.' + self.cluster_id)
                 self.mgr._orchestrator_wait([completion])
                 orchestrator.raise_if_exception(completion)
-                if len(cluster_list) == 1:
-                    self.delete_common_config_obj()
+                self.delete_config_obj()
                 return 0, "NFS Cluster Deleted Successfully", ""
             return 0, "", "Cluster does not exist"
         except Exception as e:
@@ -759,4 +784,38 @@ class NFSCluster:
             return (0, json.dumps(info_res, indent=4), '')
         except Exception as e:
             log.exception(f"Failed to show info for cluster")
+            return getattr(e, 'errno', -1), "", str(e)
+
+    @cluster_setter
+    def set_nfs_cluster_config(self, cluster_id, nfs_config):
+        try:
+            if not nfs_config:
+                return -errno.EINVAL, "", "Empty Config!!"
+            if cluster_id in available_clusters(self.mgr):
+                rados_obj = NFSRados(self.mgr, self.pool_ns)
+                if rados_obj.check_user_config():
+                    return 0, "", "NFS-Ganesha User Config already exists"
+                rados_obj.write_obj(nfs_config, self._get_user_conf_obj_name(),
+                                    self._get_common_conf_obj_name())
+                self._restart_nfs_service()
+                return 0, "NFS-Ganesha Config Set Successfully", ""
+            return -errno.ENOENT, "", "Cluster does not exist"
+        except Exception as e:
+            log.exception(f"Setting NFS-Ganesha Config failed for {cluster_id}")
+            return getattr(e, 'errno', -1), "", str(e)
+
+    @cluster_setter
+    def reset_nfs_cluster_config(self, cluster_id):
+        try:
+            if cluster_id in available_clusters(self.mgr):
+                rados_obj = NFSRados(self.mgr, self.pool_ns)
+                if not rados_obj.check_user_config():
+                    return 0, "", "NFS-Ganesha User Config does not exist"
+                rados_obj.remove_obj(self._get_user_conf_obj_name(),
+                                     self._get_common_conf_obj_name())
+                self._restart_nfs_service()
+                return 0, "NFS-Ganesha Config Reset Successfully", ""
+            return -errno.ENOENT, "", "Cluster does not exist"
+        except Exception as e:
+            log.exception(f"Resetting NFS-Ganesha Config failed for {cluster_id}")
             return getattr(e, 'errno', -1), "", str(e)

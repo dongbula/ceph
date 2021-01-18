@@ -84,6 +84,24 @@ enum {
   l_mds_root_rfiles,
   l_mds_root_rbytes,
   l_mds_root_rsnaps,
+  l_mds_scrub_backtrace_fetch,
+  l_mds_scrub_set_tag,
+  l_mds_scrub_backtrace_repaired,
+  l_mds_scrub_inotable_repaired,
+  l_mds_scrub_dir_inodes,
+  l_mds_scrub_dir_base_inodes,
+  l_mds_scrub_dirfrag_rstats,
+  l_mds_scrub_file_inodes,
+  l_mdss_handle_inode_file_caps,
+  l_mdss_ceph_cap_op_revoke,
+  l_mdss_ceph_cap_op_grant,
+  l_mdss_ceph_cap_op_trunc,
+  l_mdss_ceph_cap_op_flushsnap_ack,
+  l_mdss_ceph_cap_op_flush_ack,
+  l_mdss_handle_client_caps,
+  l_mdss_handle_client_caps_dirty,
+  l_mdss_handle_client_cap_release,
+  l_mdss_process_request_cap_release,
   l_mds_last,
 };
 
@@ -146,6 +164,7 @@ class MDSRank {
 
     MDSRank(
         mds_rank_t whoami_,
+	std::string fs_name_,
         ceph::mutex &mds_lock_,
         LogChannelRef &clog_,
         SafeTimer &timer_,
@@ -159,6 +178,7 @@ class MDSRank {
 	boost::asio::io_context& ioc);
 
     mds_rank_t get_nodeid() const { return whoami; }
+    std::string_view get_fs_name() const { return fs_name; }
     int64_t get_metadata_pool();
 
     mono_time get_starttime() const {
@@ -203,6 +223,7 @@ class MDSRank {
     }
 
     void handle_write_error(int err);
+    void handle_write_error_with_lock(int err);
 
     void update_mlogger();
 
@@ -336,13 +357,11 @@ class MDSRank {
       return map_targets.count(rank);
     }
 
-    bool evict_client(int64_t session_id, bool wait, bool blacklist,
+    bool evict_client(int64_t session_id, bool wait, bool blocklist,
                       std::ostream& ss, Context *on_killed=nullptr);
     int config_client(int64_t session_id, bool remove,
 		      const std::string& option, const std::string& value,
 		      std::ostream& ss);
-
-    void mark_base_recursively_scrubbed(inodeno_t ino);
 
     // Reference to global MDS::mds_lock, so that users of MDSRank don't
     // carry around references to the outer MDS, and we can substitute
@@ -421,6 +440,7 @@ class MDSRank {
     friend class C_MDS_MonCommand;
 
     const mds_rank_t whoami;
+    std::string fs_name;
 
     ~MDSRank();
 
@@ -441,7 +461,6 @@ class MDSRank {
      /**
      * Share MDSMap with clients
      */
-    void bcast_mds_map();  // to mounted clients
     void create_logger();
 
     void dump_clientreplay_status(Formatter *f) const;
@@ -546,6 +565,7 @@ class MDSRank {
     int dispatch_depth = 0;
 
     ceph::heartbeat_handle_d *hb = nullptr;  // Heartbeat for threads using mds_lock
+    double heartbeat_grace;
 
     map<mds_rank_t, version_t> peer_mdsmap_epoch;
 
@@ -567,8 +587,6 @@ class MDSRank {
     Beacon &beacon;
 
     int mds_slow_req_count = 0;
-
-    epoch_t last_client_mdsmap_bcast = 0;
 
     map<mds_rank_t,DecayCounter> export_targets; /* targets this MDS is exporting to or wants/tries to */
 
@@ -635,6 +653,7 @@ class MDSRankDispatcher : public MDSRank, public md_config_obs_t
 public:
   MDSRankDispatcher(
       mds_rank_t whoami_,
+      std::string fs_name,
       ceph::mutex &mds_lock_,
       LogChannelRef &clog_,
       SafeTimer &timer_,
@@ -663,7 +682,7 @@ public:
   const char** get_tracked_conf_keys() const override final;
   void handle_conf_change(const ConfigProxy& conf, const std::set<std::string>& changed) override;
 
-  void dump_sessions(const SessionFilter &filter, Formatter *f) const;
+  void dump_sessions(const SessionFilter &filter, Formatter *f, bool cap_dump=false) const;
   void evict_clients(const SessionFilter &filter,
 		     std::function<void(int,const std::string&,bufferlist&)> on_finish);
 

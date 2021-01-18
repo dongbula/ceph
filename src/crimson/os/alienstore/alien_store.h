@@ -25,11 +25,11 @@ public:
   public:
     AlienOmapIterator(ObjectMap::ObjectMapIterator& it,
 	AlienStore* store) : iter(it), store(store) {}
-    seastar::future<int> seek_to_first();
-    seastar::future<int> upper_bound(const std::string& after);
-    seastar::future<int> lower_bound(const std::string& to);
+    seastar::future<> seek_to_first();
+    seastar::future<> upper_bound(const std::string& after);
+    seastar::future<> lower_bound(const std::string& to);
     bool valid() const;
-    seastar::future<int> next();
+    seastar::future<> next();
     std::string key();
     seastar::future<std::string> tail_key();
     ceph::buffer::list value();
@@ -64,23 +64,23 @@ public:
   get_attrs_ertr::future<attrs_t> get_attrs(CollectionRef c,
                                      const ghobject_t& oid) final;
 
-  seastar::future<omap_values_t> omap_get_values(
+  read_errorator::future<omap_values_t> omap_get_values(
     CollectionRef c,
     const ghobject_t& oid,
     const omap_keys_t& keys) final;
+
+  /// Retrieves paged set of values > start (if present)
+  read_errorator::future<std::tuple<bool, omap_values_t>> omap_get_values(
+    CollectionRef c,           ///< [in] collection
+    const ghobject_t &oid,     ///< [in] oid
+    const std::optional<std::string> &start ///< [in] start, empty for begin
+    ) final; ///< @return <done, values> values.empty() iff done
 
   seastar::future<std::tuple<std::vector<ghobject_t>, ghobject_t>> list_objects(
     CollectionRef c,
     const ghobject_t& start,
     const ghobject_t& end,
     uint64_t limit) const final;
-
-  /// Retrieves paged set of values > start (if present)
-  seastar::future<std::tuple<bool, omap_values_t>> omap_get_values(
-    CollectionRef c,           ///< [in] collection
-    const ghobject_t &oid,     ///< [in] oid
-    const std::optional<std::string> &start ///< [in] start, empty for begin
-    ) final; ///< @return <done, values> values.empty() iff done
 
   seastar::future<CollectionRef> create_new_collection(const coll_t& cid) final;
   seastar::future<CollectionRef> open_collection(const coll_t& cid) final;
@@ -99,7 +99,7 @@ public:
   seastar::future<struct stat> stat(
     CollectionRef,
     const ghobject_t&) final;
-  seastar::future<ceph::bufferlist> omap_get_header(
+  read_errorator::future<ceph::bufferlist> omap_get_header(
     CollectionRef,
     const ghobject_t&) final;
   seastar::future<std::map<uint64_t, uint64_t>> fiemap(
@@ -111,7 +111,6 @@ public:
     CollectionRef ch,
     const ghobject_t& oid) final;
 
-  static void configure_thread_memory();
 private:
   constexpr static unsigned MAX_KEYS_PER_OMAP_GET_CALL = 32;
   mutable std::unique_ptr<crimson::os::ThreadPool> tp;

@@ -185,11 +185,6 @@ inline bs::error_code osdcode(int r) {
 
 // config obs ----------------------------
 
-static const char *config_keys[] = {
-  "crush_location",
-  NULL
-};
-
 class Objecter::RequestStateHook : public AdminSocketHook {
   Objecter *m_objecter;
 public:
@@ -214,6 +209,12 @@ std::unique_lock<std::mutex> Objecter::OSDSession::get_lock(object_t& oid)
 
 const char** Objecter::get_tracked_conf_keys() const
 {
+  static const char *config_keys[] = {
+    "crush_location",
+    "rados_mon_op_timeout",
+    "rados_osd_op_timeout",
+    NULL
+  };
   return config_keys;
 }
 
@@ -223,6 +224,12 @@ void Objecter::handle_conf_change(const ConfigProxy& conf,
 {
   if (changed.count("crush_location")) {
     update_crush_location();
+  }
+  if (changed.count("rados_mon_op_timeout")) {
+    mon_timeout = conf.get_val<std::chrono::seconds>("rados_mon_op_timeout");
+  }
+  if (changed.count("rados_osd_op_timeout")) {
+    osd_timeout = conf.get_val<std::chrono::seconds>("rados_osd_op_timeout");
   }
 }
 
@@ -653,17 +660,17 @@ void Objecter::_linger_reconnect(LingerOp *info, bs::error_code ec)
 {
   ldout(cct, 10) << __func__ << " " << info->linger_id << " = " << ec 
 		 << " (last_error " << info->last_error << ")" << dendl;
+  std::unique_lock wl(info->watch_lock);
   if (ec) {
-    std::unique_lock wl(info->watch_lock);
     if (!info->last_error) {
       ec = _normalize_watch_error(ec);
-      info->last_error = ec;
       if (info->handle) {
 	boost::asio::defer(finish_strand, CB_DoWatchError(this, info, ec));
       }
     }
-    wl.unlock();
   }
+
+  info->last_error = ec;
 }
 
 void Objecter::_send_linger_ping(LingerOp *info)
@@ -1179,7 +1186,7 @@ void Objecter::handle_osd_map(MOSDMap *m)
 	  OSDMap::Incremental inc(m->incremental_maps[e]);
 	  osdmap->apply_incremental(inc);
 
-          emit_blacklist_events(inc);
+          emit_blocklist_events(inc);
 
 	  logger->inc(l_osdc_map_inc);
 	}
@@ -1188,7 +1195,7 @@ void Objecter::handle_osd_map(MOSDMap *m)
           auto new_osdmap = std::make_unique<OSDMap>();
           new_osdmap->decode(m->maps[e]);
 
-          emit_blacklist_events(*osdmap, *new_osdmap);
+          emit_blocklist_events(*osdmap, *new_osdmap);
           osdmap = std::move(new_osdmap);
 
 	  logger->inc(l_osdc_map_full);
@@ -1360,56 +1367,56 @@ void Objecter::handle_osd_map(MOSDMap *m)
   }
 }
 
-void Objecter::enable_blacklist_events()
+void Objecter::enable_blocklist_events()
 {
   unique_lock wl(rwlock);
 
-  blacklist_events_enabled = true;
+  blocklist_events_enabled = true;
 }
 
-void Objecter::consume_blacklist_events(std::set<entity_addr_t> *events)
+void Objecter::consume_blocklist_events(std::set<entity_addr_t> *events)
 {
   unique_lock wl(rwlock);
 
   if (events->empty()) {
-    events->swap(blacklist_events);
+    events->swap(blocklist_events);
   } else {
-    for (const auto &i : blacklist_events) {
+    for (const auto &i : blocklist_events) {
       events->insert(i);
     }
-    blacklist_events.clear();
+    blocklist_events.clear();
   }
 }
 
-void Objecter::emit_blacklist_events(const OSDMap::Incremental &inc)
+void Objecter::emit_blocklist_events(const OSDMap::Incremental &inc)
 {
-  if (!blacklist_events_enabled) {
+  if (!blocklist_events_enabled) {
     return;
   }
 
-  for (const auto &i : inc.new_blacklist) {
-    blacklist_events.insert(i.first);
+  for (const auto &i : inc.new_blocklist) {
+    blocklist_events.insert(i.first);
   }
 }
 
-void Objecter::emit_blacklist_events(const OSDMap &old_osd_map,
+void Objecter::emit_blocklist_events(const OSDMap &old_osd_map,
                                      const OSDMap &new_osd_map)
 {
-  if (!blacklist_events_enabled) {
+  if (!blocklist_events_enabled) {
     return;
   }
 
   std::set<entity_addr_t> old_set;
   std::set<entity_addr_t> new_set;
 
-  old_osd_map.get_blacklist(&old_set);
-  new_osd_map.get_blacklist(&new_set);
+  old_osd_map.get_blocklist(&old_set);
+  new_osd_map.get_blocklist(&new_set);
 
   std::set<entity_addr_t> delta_set;
   std::set_difference(
       new_set.begin(), new_set.end(), old_set.begin(), old_set.end(),
       std::inserter(delta_set, delta_set.begin()));
-  blacklist_events.insert(delta_set.begin(), delta_set.end());
+  blocklist_events.insert(delta_set.begin(), delta_set.end());
 }
 
 // op pool check
@@ -2797,6 +2804,14 @@ int Objecter::_calc_target(op_target_t *t, Connection *con, bool any_change)
 	sort_bitwise,
 	t->recovery_deletes,
 	recovery_deletes,
+	t->peering_crush_bucket_count,
+	pi->peering_crush_bucket_count,
+	t->peering_crush_bucket_target,
+	pi->peering_crush_bucket_target,
+	t->peering_crush_bucket_barrier,
+	pi->peering_crush_bucket_barrier,
+	t->peering_crush_mandatory_member,
+	pi->peering_crush_mandatory_member,
 	prev_pgid)) {
     force_resend = true;
   }
@@ -2848,6 +2863,10 @@ int Objecter::_calc_target(op_target_t *t, Connection *con, bool any_change)
     t->actual_pgid = spgid;
     t->sort_bitwise = sort_bitwise;
     t->recovery_deletes = recovery_deletes;
+    t->peering_crush_bucket_count = pi->peering_crush_bucket_count;
+    t->peering_crush_bucket_target = pi->peering_crush_bucket_target;
+    t->peering_crush_bucket_barrier = pi->peering_crush_bucket_barrier;
+    t->peering_crush_mandatory_member = pi->peering_crush_mandatory_member;
     ldout(cct, 10) << __func__ << " "
 		   << " raw pgid " << pgid << " -> actual " << t->actual_pgid
 		   << " acting " << acting
@@ -4619,23 +4638,26 @@ int Objecter::RequestStateHook::call(std::string_view command,
   return 0;
 }
 
-void Objecter::blacklist_self(bool set)
+void Objecter::blocklist_self(bool set)
 {
-  ldout(cct, 10) << "blacklist_self " << (set ? "add" : "rm") << dendl;
+  ldout(cct, 10) << "blocklist_self " << (set ? "add" : "rm") << dendl;
 
   vector<string> cmd;
-  cmd.push_back("{\"prefix\":\"osd blacklist\", ");
+  cmd.push_back("{\"prefix\":\"osd blocklist\", ");
   if (set)
-    cmd.push_back("\"blacklistop\":\"add\",");
+    cmd.push_back("\"blocklistop\":\"add\",");
   else
-    cmd.push_back("\"blacklistop\":\"rm\",");
+    cmd.push_back("\"blocklistop\":\"rm\",");
   stringstream ss;
-  // this is somewhat imprecise in that we are blacklisting our first addr only
+  // this is somewhat imprecise in that we are blocklisting our first addr only
   ss << messenger->get_myaddrs().front().get_legacy_str();
   cmd.push_back("\"addr\":\"" + ss.str() + "\"");
 
   auto m = new MMonCommand(monc->get_fsid());
   m->cmd = cmd;
+
+  // NOTE: no fallback to legacy blacklist command implemented here
+  // since this is only used for test code.
 
   monc->send_mon_message(m);
 }
@@ -4888,13 +4910,12 @@ Objecter::OSDSession::~OSDSession()
 
 Objecter::Objecter(CephContext *cct,
 		   Messenger *m, MonClient *mc,
-		   boost::asio::io_context& service,
-		   double mon_timeout,
-		   double osd_timeout) :
-  Dispatcher(cct), messenger(m), monc(mc), service(service),
-  mon_timeout(ceph::make_timespan(mon_timeout)),
-  osd_timeout(ceph::make_timespan(osd_timeout))
-{}
+		   boost::asio::io_context& service) :
+  Dispatcher(cct), messenger(m), monc(mc), service(service)
+{
+  mon_timeout = cct->_conf.get_val<std::chrono::seconds>("rados_mon_op_timeout");
+  osd_timeout = cct->_conf.get_val<std::chrono::seconds>("rados_osd_op_timeout");
+}
 
 Objecter::~Objecter()
 {
@@ -4921,7 +4942,7 @@ Objecter::~Objecter()
  * sending any more operations to OSDs.  Use this
  * when it is known that the client can't trust
  * anything from before this epoch (e.g. due to
- * client blacklist at this epoch).
+ * client blocklist at this epoch).
  */
 void Objecter::set_epoch_barrier(epoch_t epoch)
 {

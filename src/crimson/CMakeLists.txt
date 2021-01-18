@@ -12,15 +12,14 @@ set_target_properties(crimson::cflags PROPERTIES
   INTERFACE_LINK_LIBRARIES Seastar::seastar)
 
 set(crimson_common_srcs
-  admin/admin_socket.cc
-  admin/osd_admin.cc
   common/assert.cc
   common/buffer_io.cc
   common/config_proxy.cc
   common/formatter.cc
   common/perf_counters_collection.cc
   common/log.cc
-  common/throttle.cc)
+  common/throttle.cc
+  common/tri_mutex.cc)
 
 # the specialized version of ceph-common, where
 #  - the logging is sent to Seastar backend
@@ -79,7 +78,6 @@ add_library(crimson-common STATIC
   ${PROJECT_SOURCE_DIR}/src/common/Graylog.cc
   ${PROJECT_SOURCE_DIR}/src/common/ostream_temp.cc
   ${PROJECT_SOURCE_DIR}/src/common/LogEntry.cc
-  ${PROJECT_SOURCE_DIR}/src/common/SubProcess.cc
   ${PROJECT_SOURCE_DIR}/src/common/TextTable.cc
   ${PROJECT_SOURCE_DIR}/src/common/Thread.cc
   ${PROJECT_SOURCE_DIR}/src/common/PluginRegistry.cc
@@ -125,7 +123,13 @@ target_compile_definitions(crimson-common PRIVATE
 
 set(crimson_common_deps
   Boost::iostreams
-  Boost::random)
+  Boost::random
+  json_spirit)
+
+if(WITH_JAEGER)
+  include_directories(SYSTEM ${CMAKE_BINARY_DIR}/external/include)
+  list(APPEND crimson_common_deps jaeger-base)
+endif()
 
 if(NOT WITH_SYSTEM_BOOST)
   list(APPEND crimson_common_deps ${ZLIB_LIBRARIES})
@@ -133,7 +137,6 @@ endif()
 
 target_link_libraries(crimson-common
   PUBLIC
-    json_spirit
     crimson::cflags
   PRIVATE
     crc32
@@ -182,5 +185,7 @@ target_link_libraries(crimson
   PUBLIC
     crimson-common
     crimson::cflags)
+add_subdirectory(admin)
 add_subdirectory(os)
 add_subdirectory(osd)
+add_subdirectory(tools)

@@ -12,6 +12,7 @@
  *
  */
 
+#include <limits>
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -70,7 +71,9 @@ KernelDevice::KernelDevice(CephContext* cct, aio_callback_t cb, void *cbpriv, ai
   unsigned int iodepth = cct->_conf->bdev_aio_max_queue_depth;
 
   if (use_ioring && ioring_queue_t::supported()) {
-    io_queue = std::make_unique<ioring_queue_t>(iodepth);
+    bool use_ioring_hipri = cct->_conf.get_val<bool>("bdev_ioring_hipri");
+    bool use_ioring_sqthread_poll = cct->_conf.get_val<bool>("bdev_ioring_sqthread_poll");
+    io_queue = std::make_unique<ioring_queue_t>(iodepth, use_ioring_hipri, use_ioring_sqthread_poll);
   } else {
     static bool once;
     if (use_ioring && !once) {
@@ -85,12 +88,36 @@ KernelDevice::KernelDevice(CephContext* cct, aio_callback_t cb, void *cbpriv, ai
 int KernelDevice::_lock()
 {
   dout(10) << __func__ << " " << fd_directs[WRITE_LIFE_NOT_SET] << dendl;
-  int r = ::flock(fd_directs[WRITE_LIFE_NOT_SET], LOCK_EX | LOCK_NB);
-  if (r < 0) {
-    derr << __func__ << " flock failed on " << path << dendl;
-    return -errno;
+  // When the block changes, systemd-udevd will open the block,
+  // read some information and close it. Then a failure occurs here.
+  // So we need to try again here.
+  int fd = fd_directs[WRITE_LIFE_NOT_SET];
+  uint64_t nr_tries = 0;
+  for (;;) {
+    struct flock fl = { F_WRLCK,
+                        SEEK_SET };
+    int r = ::fcntl(fd, F_OFD_SETLK, &fl);
+    if (r < 0) {
+      if (errno == EINVAL) {
+        r = ::flock(fd, LOCK_EX | LOCK_NB);
+      }
+    }
+    if (r == 0) {
+      return 0;
+    }
+    if (errno != EAGAIN) {
+      return -errno;
+    }
+    dout(1) << __func__ << " flock busy on " << path << dendl;
+    if (const uint64_t max_retry =
+	cct->_conf.get_val<uint64_t>("bdev_flock_retry");
+        max_retry > 0 && nr_tries++ == max_retry) {
+      return -EAGAIN;
+    }
+    double retry_interval =
+      cct->_conf.get_val<double>("bdev_flock_retry_interval");
+    std::this_thread::sleep_for(ceph::make_timespan(retry_interval));
   }
-  return 0;
 }
 
 int KernelDevice::open(const string& p)
@@ -787,6 +814,8 @@ void KernelDevice::aio_submit(IOContext *ioc)
 
   void *priv = static_cast<void*>(ioc);
   int r, retries = 0;
+  // num of pending aios should not overflow when passed to submit_batch()
+  assert(pending <= std::numeric_limits<uint16_t>::max());
   r = io_queue->submit_batch(ioc->running_aios.begin(), e,
 			     pending, priv, &retries);
 

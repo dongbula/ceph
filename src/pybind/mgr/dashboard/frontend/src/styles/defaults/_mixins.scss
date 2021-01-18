@@ -1,17 +1,16 @@
-@use '../vendor/variables';
-@use 'bootstrap-defaults';
+@use '../vendor/variables' as vv;
 @use 'functions';
 
 @mixin table-cell {
   border: 0;
-  border-bottom: 1px solid bootstrap-defaults.$color-light-gray;
-  border-left: 1px solid bootstrap-defaults.$color-light-gray;
+  border-bottom: 1px solid vv.$gray-400;
+  border-left: 1px solid vv.$gray-400;
   padding: 5px;
 }
 
 @mixin hf {
-  background-color: bootstrap-defaults.$color-whitesmoke-gray;
-  border-bottom: 1px solid bootstrap-defaults.$color-light-gray;
+  background-color: vv.$gray-200;
+  border-bottom: 1px solid vv.$gray-400;
 }
 
 @mixin fluid-font-size($min-vw, $max-vw, $min-font-size, $max-font-size) {

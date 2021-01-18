@@ -5,13 +5,14 @@ import { By } from '@angular/platform-browser';
 import { BrowserAnimationsModule } from '@angular/platform-browser/animations';
 
 import { NgbNavModule } from '@ng-bootstrap/ng-bootstrap';
-import * as _ from 'lodash';
+import _ from 'lodash';
+import { NgxPipeFunctionModule } from 'ngx-pipe-function';
 import { of } from 'rxjs';
 
-import { configureTestBed } from '../../../../testing/unit-test-helper';
-import { OsdService } from '../../../shared/api/osd.service';
-import { HddSmartDataV1, NvmeSmartDataV1, SmartDataResult } from '../../../shared/models/smart';
-import { SharedModule } from '../../../shared/shared.module';
+import { OsdService } from '~/app/shared/api/osd.service';
+import { HddSmartDataV1, NvmeSmartDataV1, SmartDataResult } from '~/app/shared/models/smart';
+import { SharedModule } from '~/app/shared/shared.module';
+import { configureTestBed } from '~/testing/unit-test-helper';
 import { SmartListComponent } from './smart-list.component';
 
 describe('OsdSmartListComponent', () => {
@@ -79,9 +80,43 @@ describe('OsdSmartListComponent', () => {
     component.ngOnChanges(changes);
   };
 
+  /**
+   * Verify an alert panel and its attributes.
+   *
+   * @param selector The CSS selector for the alert panel.
+   * @param panelTitle The title should be displayed.
+   * @param panelType Alert level of panel. Can be in `warning` or `info`.
+   * @param panelSize Pass `slim` for slim alert panel.
+   */
+  const verifyAlertPanel = (
+    selector: string,
+    panelTitle: string,
+    panelType: 'warning' | 'info',
+    panelSize?: 'slim'
+  ) => {
+    const alertPanel = fixture.debugElement.query(By.css(selector));
+    expect(component.incompatible).toBe(false);
+    expect(component.loading).toBe(false);
+
+    expect(alertPanel.attributes.type).toBe(panelType);
+    if (panelSize === 'slim') {
+      expect(alertPanel.attributes.title).toBe(panelTitle);
+      expect(alertPanel.attributes.size).toBe(panelSize);
+    } else {
+      const panelText = alertPanel.query(By.css('.alert-panel-text'));
+      expect(panelText.nativeElement.textContent).toBe(panelTitle);
+    }
+  };
+
   configureTestBed({
     declarations: [SmartListComponent],
-    imports: [BrowserAnimationsModule, SharedModule, HttpClientTestingModule, NgbNavModule]
+    imports: [
+      BrowserAnimationsModule,
+      SharedModule,
+      HttpClientTestingModule,
+      NgbNavModule,
+      NgxPipeFunctionModule
+    ]
   });
 
   beforeEach(() => {
@@ -143,22 +178,61 @@ describe('OsdSmartListComponent', () => {
   it('should display info panel for passed self test', () => {
     initializeComponentWithData('hdd_v1');
     fixture.detectChanges();
-    const alertPanel = fixture.debugElement.query(By.css('cd-alert-panel#alert-self-test-passed'));
-    expect(component.incompatible).toBe(false);
-    expect(component.loading).toBe(false);
-    expect(alertPanel.attributes.size).toBe('slim');
-    expect(alertPanel.attributes.title).toBe('SMART overall-health self-assessment test result');
-    expect(alertPanel.attributes.type).toBe('info');
+    verifyAlertPanel(
+      'cd-alert-panel#alert-self-test-passed',
+      'SMART overall-health self-assessment test result',
+      'info',
+      'slim'
+    );
   });
 
   it('should display warning panel for failed self test', () => {
     initializeComponentWithData('hdd_v1', { 'smart_status.passed': false });
     fixture.detectChanges();
-    const alertPanel = fixture.debugElement.query(By.css('cd-alert-panel#alert-self-test-failed'));
-    expect(component.incompatible).toBe(false);
-    expect(component.loading).toBe(false);
-    expect(alertPanel.attributes.size).toBe('slim');
-    expect(alertPanel.attributes.title).toBe('SMART overall-health self-assessment test result');
-    expect(alertPanel.attributes.type).toBe('warning');
+    verifyAlertPanel(
+      'cd-alert-panel#alert-self-test-failed',
+      'SMART overall-health self-assessment test result',
+      'warning',
+      'slim'
+    );
+  });
+
+  it('should display warning panel for unknown self test', () => {
+    initializeComponentWithData('hdd_v1', { smart_status: undefined });
+    fixture.detectChanges();
+    verifyAlertPanel(
+      'cd-alert-panel#alert-self-test-unknown',
+      'SMART overall-health self-assessment test result',
+      'warning',
+      'slim'
+    );
+  });
+
+  it('should display info panel for empty device info', () => {
+    initializeComponentWithData('hdd_v1');
+    const deviceId: string = _.keys(component.data)[0];
+    component.data[deviceId]['info'] = {};
+    fixture.detectChanges();
+    component.nav.select(1);
+    fixture.detectChanges();
+    verifyAlertPanel(
+      'cd-alert-panel#alert-device-info-unavailable',
+      'No device information available for this device.',
+      'info'
+    );
+  });
+
+  it('should display info panel for empty SMART data', () => {
+    initializeComponentWithData('hdd_v1');
+    const deviceId: string = _.keys(component.data)[0];
+    component.data[deviceId]['smart'] = {};
+    fixture.detectChanges();
+    component.nav.select(2);
+    fixture.detectChanges();
+    verifyAlertPanel(
+      'cd-alert-panel#alert-device-smart-data-unavailable',
+      'No SMART data available for this device.',
+      'info'
+    );
   });
 });

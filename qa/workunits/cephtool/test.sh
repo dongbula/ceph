@@ -1165,6 +1165,20 @@ function test_mon_mon()
   ceph mon feature set kraken --yes-i-really-mean-it
   expect_false ceph mon feature set abcd
   expect_false ceph mon feature set abcd --yes-i-really-mean-it
+
+  # test elector
+  expect_failure $TEMP_DIR ceph mon add disallowed_leader $first
+  ceph mon set election_strategy disallow
+  ceph mon add disallowed_leader $first
+  ceph mon set election_strategy connectivity
+  ceph mon rm disallowed_leader $first
+  ceph mon set election_strategy classic
+  expect_failure $TEMP_DIR ceph mon rm disallowed_leader $first
+
+  # test mon stat
+  # don't check output, just ensure it does not fail.
+  ceph mon stat
+  ceph mon stat -f json | jq '.'
 }
 
 function test_mon_priority_and_weight()
@@ -1386,34 +1400,37 @@ function test_mon_config_key()
 function test_mon_osd()
 {
   #
-  # osd blacklist
+  # osd blocklist
   #
   bl=192.168.0.1:0/1000
-  ceph osd blacklist add $bl
-  ceph osd blacklist ls | grep $bl
-  ceph osd blacklist ls --format=json-pretty  | sed 's/\\\//\//' | grep $bl
+  ceph osd blocklist add $bl
+  ceph osd blocklist ls | grep $bl
+  ceph osd blocklist ls --format=json-pretty  | sed 's/\\\//\//' | grep $bl
   ceph osd dump --format=json-pretty | grep $bl
   ceph osd dump | grep $bl
-  ceph osd blacklist rm $bl
-  ceph osd blacklist ls | expect_false grep $bl
+  ceph osd blocklist rm $bl
+  ceph osd blocklist ls | expect_false grep $bl
 
   bl=192.168.0.1
   # test without nonce, invalid nonce
-  ceph osd blacklist add $bl
-  ceph osd blacklist ls | grep $bl
-  ceph osd blacklist rm $bl
-  ceph osd blacklist ls | expect_false grep $bl
-  expect_false "ceph osd blacklist $bl/-1"
-  expect_false "ceph osd blacklist $bl/foo"
+  ceph osd blocklist add $bl
+  ceph osd blocklist ls | grep $bl
+  ceph osd blocklist rm $bl
+  ceph osd blocklist ls | expect_false grep $bl
+  expect_false "ceph osd blocklist $bl/-1"
+  expect_false "ceph osd blocklist $bl/foo"
 
   # test with wrong address
-  expect_false "ceph osd blacklist 1234.56.78.90/100"
+  expect_false "ceph osd blocklist 1234.56.78.90/100"
 
   # Test `clear`
-  ceph osd blacklist add $bl
-  ceph osd blacklist ls | grep $bl
-  ceph osd blacklist clear
-  ceph osd blacklist ls | expect_false grep $bl
+  ceph osd blocklist add $bl
+  ceph osd blocklist ls | grep $bl
+  ceph osd blocklist clear
+  ceph osd blocklist ls | expect_false grep $bl
+
+  # deprecated syntax?
+  ceph osd blacklist ls
 
   #
   # osd crush

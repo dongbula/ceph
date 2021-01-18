@@ -5,9 +5,9 @@ import { NgForm, ReactiveFormsModule } from '@angular/forms';
 import { NgbActiveModal, NgbModalModule, NgbModalRef } from '@ng-bootstrap/ng-bootstrap';
 import { Observable, Subscriber, timer as observableTimer } from 'rxjs';
 
-import { configureTestBed, modalServiceShow } from '../../../../testing/unit-test-helper';
-import { DirectivesModule } from '../../directives/directives.module';
-import { ModalService } from '../../services/modal.service';
+import { DirectivesModule } from '~/app/shared/directives/directives.module';
+import { ModalService } from '~/app/shared/services/modal.service';
+import { configureTestBed, modalServiceShow } from '~/testing/unit-test-helper';
 import { AlertPanelComponent } from '../alert-panel/alert-panel.component';
 import { LoadingPanelComponent } from '../loading-panel/loading-panel.component';
 import { CriticalConfirmationModalComponent } from './critical-confirmation-modal.component';
@@ -17,7 +17,7 @@ export class MockModule {}
 
 @Component({
   template: `
-    <button type="button" class="btn btn-secondary" (click)="openCtrlDriven()">
+    <button type="button" class="btn btn-danger" (click)="openCtrlDriven()">
       <i class="fa fa-times"></i>Deletion Ctrl-Test
       <ng-template #ctrlDescription>
         The spinner is handled by the controller if you have use the modal as ViewChild in order to
@@ -25,7 +25,7 @@ export class MockModule {}
       </ng-template>
     </button>
 
-    <button type="button" class="btn btn-secondary" (click)="openModalDriven()">
+    <button type="button" class="btn btn-danger" (click)="openModalDriven()">
       <i class="fa fa-times"></i>Deletion Modal-Test
       <ng-template #modalDescription>
         The spinner is handled by the modal if your given deletion function returns a Observable.

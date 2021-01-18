@@ -10,7 +10,6 @@ from tempfile import mkstemp as tempfile_mkstemp
 import math
 from time import sleep
 from tasks.cephfs.cephfs_test_case import CephFSTestCase
-from teuthology.misc import sudo_write_file
 from teuthology.orchestra.run import CommandFailedError
 
 log = logging.getLogger(__name__)
@@ -39,9 +38,8 @@ class TestCephFSShell(CephFSTestCase):
         super(TestCephFSShell, self).setUp()
 
         conf_contents = "[cephfs-shell]\ncolors = False\ndebug = True\n"
-        confpath = self.mount_a.run_shell(args=['mktemp']).stdout.\
-            getvalue().strip()
-        sudo_write_file(self.mount_a.client_remote, confpath, conf_contents)
+        confpath = self.mount_a.client_remote.sh('mktemp').strip()
+        self.mount_a.client_remote.write_file(confpath, conf_contents)
         self.default_shell_conf_path = confpath
 
     def run_cephfs_shell_cmd(self, cmd, mount_x=None, shell_conf_path=None,
@@ -516,7 +514,8 @@ class TestDU(TestCephFSShell):
     def test_du_works_for_regfiles(self):
         regfilename = 'some_regfile'
         regfile_abspath = path.join(self.mount_a.mountpoint, regfilename)
-        sudo_write_file(self.mount_a.client_remote, regfile_abspath, 'somedata')
+        self.mount_a.client_remote.write_file(regfile_abspath,
+                                              'somedata', sudo=True)
 
         size = humansize(self.mount_a.stat(regfile_abspath)['st_size'])
         expected_output = r'{}{}{}'.format(size, " +", regfilename)
@@ -530,7 +529,8 @@ class TestDU(TestCephFSShell):
         regfilename = 'some_regfile'
         regfile_abspath = path.join(dir_abspath, regfilename)
         self.mount_a.run_shell('mkdir ' + dir_abspath)
-        sudo_write_file(self.mount_a.client_remote, regfile_abspath, 'somedata')
+        self.mount_a.client_remote.write_file(regfile_abspath,
+                                              'somedata', sudo=True)
 
         # XXX: we stat `regfile_abspath` here because ceph du reports a non-empty
         # directory's size as sum of sizes of all files under it.
@@ -555,8 +555,8 @@ class TestDU(TestCephFSShell):
     def test_du_works_for_hardlinks(self):
         regfilename = 'some_regfile'
         regfile_abspath = path.join(self.mount_a.mountpoint, regfilename)
-        sudo_write_file(self.mount_a.client_remote, regfile_abspath,
-                        'somedata')
+        self.mount_a.client_remote.write_file(regfile_abspath,
+                                              'somedata', sudo=True)
         hlinkname = 'some_hardlink'
         hlink_abspath = path.join(self.mount_a.mountpoint, hlinkname)
         self.mount_a.run_shell(['sudo', 'ln', regfile_abspath,
@@ -571,7 +571,8 @@ class TestDU(TestCephFSShell):
     def test_du_works_for_softlinks_to_files(self):
         regfilename = 'some_regfile'
         regfile_abspath = path.join(self.mount_a.mountpoint, regfilename)
-        sudo_write_file(self.mount_a.client_remote, regfile_abspath, 'somedata')
+        self.mount_a.client_remote.write_file(regfile_abspath,
+                                              'somedata', sudo=True)
         slinkname = 'some_softlink'
         slink_abspath = path.join(self.mount_a.mountpoint, slinkname)
         self.mount_a.run_shell(['ln', '-s', regfile_abspath, slink_abspath])
@@ -626,10 +627,10 @@ class TestDU(TestCephFSShell):
         self.mount_a.run_shell('mkdir -p ' + dir21_abspath)
         self.mount_a.run_shell('touch ' + regfile121_abspath)
 
-        sudo_write_file(self.mount_a.client_remote, regfile_abspath,
-            'somedata')
-        sudo_write_file(self.mount_a.client_remote, regfile121_abspath,
-            'somemoredata')
+        self.mount_a.client_remote.write_file(regfile_abspath,
+                                              'somedata', sudo=True)
+        self.mount_a.client_remote.write_file(regfile121_abspath,
+                                              'somemoredata', sudo=True)
 
         # TODO: is there a way to trigger/force update ceph.dir.rbytes?
         # wait so that attr ceph.dir.rbytes gets a chance to be updated.
@@ -817,8 +818,8 @@ class TestQuota(TestCephFSShell):
         file_abspath = path.join(dir_abspath, filename)
         try:
             # Write should fail as bytes quota is set to 6
-            sudo_write_file(self.mount_a.client_remote, file_abspath,
-                    'Disk raise Exception')
+            self.mount_a.client_remote.write_file(file_abspath,
+                    'Disk raise Exception', sudo=True)
             raise Exception("Write should have failed")
         except CommandFailedError:
             # Test should pass only when write command fails
@@ -871,36 +872,89 @@ class TestXattr(TestCephFSShell):
         self.negtest_cephfs_shell_cmd(cmd=['getxattr', self.dir_name, input_val[0]])
         self.negtest_cephfs_shell_cmd(cmd=['listxattr', self.dir_name])
 
-#    def test_ls(self):
-#        """
-#        Test that ls passes
-#        """
-#        o = self.get_cephfs_shell_cmd_output("ls")
-#        log.info("cephfs-shell output:\n{}".format(o))
-#
-#        o = self.mount_a.run_shell(['ls']).stdout.getvalue().strip().replace("\n", " ").split()
-#        log.info("mount_a output:\n{}".format(o))
-#
-#        # ls should not list hidden files without the -a switch
-#        if '.' in o or '..' in o:
-#            log.info('ls failed')
-#        else:
-#            log.info('ls succeeded')
-#
-#    def test_ls_a(self):
-#        """
-#        Test that ls -a passes
-#        """
-#        o = self.get_cephfs_shell_cmd_output("ls -a")
-#        log.info("cephfs-shell output:\n{}".format(o))
-#
-#        o = self.mount_a.run_shell(['ls', '-a']).stdout.getvalue().strip().replace("\n", " ").split()
-#        log.info("mount_a output:\n{}".format(o))
-#
-#        if '.' in o and '..' in o:
-#            log.info('ls -a succeeded')
-#        else:
-#            log.info('ls -a failed')
+class TestLS(TestCephFSShell):
+    dir_name = ('test_dir')
+    hidden_dir_name = ('.test_hidden_dir')
+
+    def test_ls(self):
+        """ Test that ls prints files in CWD. """
+        self.run_cephfs_shell_cmd(f'mkdir {self.dir_name}')
+
+        ls_output = self.get_cephfs_shell_cmd_output("ls")
+        log.info(f"output of ls command:\n{ls_output}")
+
+        self.assertIn(self.dir_name, ls_output)
+
+    def test_ls_a(self):
+        """ Test ls -a prints hidden files in CWD."""
+
+        self.run_cephfs_shell_cmd(f'mkdir {self.hidden_dir_name}')
+
+        ls_a_output = self.get_cephfs_shell_cmd_output(['ls', '-a'])
+        log.info(f"output of ls -a command:\n{ls_a_output}")
+
+        self.assertIn(self.hidden_dir_name, ls_a_output)
+
+    def test_ls_does_not_print_hidden_dir(self):
+        """ Test ls command does not print hidden directory """
+
+        self.run_cephfs_shell_cmd(f'mkdir {self.hidden_dir_name}')
+
+        ls_output = self.get_cephfs_shell_cmd_output("ls")
+        log.info(f"output of ls command:\n{ls_output}")
+
+        self.assertNotIn(self.hidden_dir_name, ls_output)
+
+    def test_ls_a_prints_non_hidden_dir(self):
+        """ Test ls -a command prints non hidden directory """
+
+        self.run_cephfs_shell_cmd(f'mkdir {self.hidden_dir_name} {self.dir_name}')
+
+        ls_a_output = self.get_cephfs_shell_cmd_output(['ls', '-a'])
+        log.info(f"output of ls -a command:\n{ls_a_output}")
+
+        self.assertIn(self.dir_name, ls_a_output)
+
+    def test_ls_H_prints_human_readable_file_size(self):
+        """ Test "ls -lH" prints human readable file size."""
+
+        file_sizes = ['1','1K', '1M', '1G']
+        file_names = ['dump1', 'dump2', 'dump3', 'dump4']
+
+
+        for (file_size, file_name) in zip(file_sizes, file_names):
+            temp_file = self.mount_a.client_remote.mktemp(file_name)
+            self.mount_a.run_shell(f"fallocate -l {file_size} {temp_file}")
+            self.mount_a.run_shell(f'mv {temp_file} ./')
+
+        ls_H_output = self.get_cephfs_shell_cmd_output(['ls', '-lH'])
+
+        ls_H_file_size = set()
+        for line in ls_H_output.split('\n'):
+            ls_H_file_size.add(line.split()[1])
+
+        # test that file sizes are in human readable format
+        self.assertEqual({'1B','1K', '1M', '1G'}, ls_H_file_size)
+
+    def test_ls_s_sort_by_size(self):
+        """ Test "ls -S" sorts file listing by file_size """
+        test_file1 = "test_file1.txt"
+        test_file2 = "test_file2.txt"
+        file1_content = 'A' * 102
+        file2_content = 'B' * 10
+
+        self.run_cephfs_shell_cmd(f"write {test_file1}", stdin=file1_content)
+        self.run_cephfs_shell_cmd(f"write {test_file2}", stdin=file2_content)
+
+        ls_s_output = self.get_cephfs_shell_cmd_output(['ls', '-lS'])
+
+        file_sizes = []
+        for line in ls_s_output.split('\n'):
+            file_sizes.append(line.split()[1])
+
+        #test that file size are in ascending order
+        self.assertEqual(file_sizes, sorted(file_sizes))
+
 
 class TestMisc(TestCephFSShell):
     def test_issue_cephfs_shell_cmd_at_invocation(self):
@@ -944,7 +998,7 @@ class TestShellOpts(TestCephFSShell):
     def write_tempconf(self, confcontents):
         self.tempconfpath = self.mount_a.client_remote.mktemp(
             suffix='cephfs-shell.conf')
-        sudo_write_file(self.mount_a.client_remote, self.tempconfpath,
+        self.mount_a.client_remote.write_file(self.tempconfpath,
                          confcontents)
 
     def test_reading_conf(self):

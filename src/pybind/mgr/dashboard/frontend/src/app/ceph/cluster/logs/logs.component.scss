@@ -1,10 +1,16 @@
-@use './src/styles/defaults/bootstrap-defaults' as bd;
+@use './src/styles/vendor/variables' as vv;
 
 p {
   font-family: monospace;
 }
 
 .card {
+  .btn-group {
+    margin-top: -45px;
+    position: absolute;
+    right: 0;
+  }
+
   div p {
     display: flex;
 
@@ -27,22 +33,22 @@ p {
   }
 
   .err {
-    color: bd.$color-pink;
+    color: vv.$danger;
   }
 
   .warn {
-    color: bd.$color-bright-yellow;
+    color: vv.$warning;
   }
 
   .info {
-    color: bd.$color-brand-teal;
+    color: vv.$info;
+  }
+
+  .debug {
+    color: vv.$gray-700;
   }
 }
 
-::ng-deep ngb-timepicker input.ngb-tp-input {
+::ng-deep cd-logs ngb-timepicker input.ngb-tp-input {
   width: 3.5rem !important;
-}
-
-.middle {
-  padding-top: 7px;
 }

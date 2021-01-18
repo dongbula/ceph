@@ -1,6 +1,5 @@
 from __future__ import absolute_import
 
-import datetime
 import json
 
 import pytest
@@ -8,6 +7,8 @@ import yaml
 
 from ceph.deployment.service_spec import ServiceSpec
 from ceph.deployment import inventory
+from ceph.utils import datetime_now
+from mgr_module import HandleCommandResult
 
 from test_orchestrator import TestOrchestrator as _TestOrchestrator
 from tests import mock
@@ -15,7 +16,7 @@ from tests import mock
 from orchestrator import raise_if_exception, Completion, ProgressReference
 from orchestrator import InventoryHost, DaemonDescription, ServiceDescription
 from orchestrator import OrchestratorValidationError
-from orchestrator.module import to_format
+from orchestrator.module import to_format, Format, OrchestratorCli, preview_table_osd
 
 
 def _test_resource(data, resource_class, extra=None):
@@ -98,6 +99,7 @@ def some_complex_completion():
             lambda four: four + 1))
     return c
 
+
 def test_promise_mondatic_then_combined():
     p = some_complex_completion()
     p.finalize()
@@ -135,13 +137,15 @@ def test_progress():
                                       completion=lambda: Completion(
                                           on_complete=lambda _: progress_val))
     )
-    mgr.remote.assert_called_with('progress', 'update', c.progress_reference.progress_id, 'hello world', 0.0, [('origin', 'orchestrator')])
+    mgr.remote.assert_called_with('progress', 'update', c.progress_reference.progress_id, 'hello world', 0.0, [
+                                  ('origin', 'orchestrator')])
 
     c.finalize()
     mgr.remote.assert_called_with('progress', 'complete', c.progress_reference.progress_id)
 
     c.progress_reference.update()
-    mgr.remote.assert_called_with('progress', 'update', c.progress_reference.progress_id, 'hello world', progress_val, [('origin', 'orchestrator')])
+    mgr.remote.assert_called_with('progress', 'update', c.progress_reference.progress_id,
+                                  'hello world', progress_val, [('origin', 'orchestrator')])
     assert not c.progress_reference.effective
 
     progress_val = 1
@@ -191,8 +195,8 @@ def test_fail():
     assert isinstance(c.exception, KeyError)
 
     with pytest.raises(ValueError,
-                  match='Invalid State: called fail, but Completion is already finished: {}'.format(
-                      str(ZeroDivisionError()))):
+                       match='Invalid State: called fail, but Completion is already finished: {}'.format(
+                           str(ZeroDivisionError()))):
         c._first_promise.fail(ZeroDivisionError())
 
 
@@ -234,6 +238,7 @@ def test_pretty_print():
 
     assert p.result == 5
 
+
 def test_apply():
     to = _TestOrchestrator('', 0, 0)
     completion = to.apply([
@@ -242,7 +247,7 @@ def test_apply():
         ServiceSpec(service_type='nfs'),
     ])
     completion.finalize(42)
-    assert  completion.result == [None, None, None]
+    assert completion.result == [None, None, None]
 
 
 def test_yaml():
@@ -251,8 +256,9 @@ daemon_id: ubuntu
 hostname: ubuntu
 status: 1
 status_desc: starting
+is_active: false
 events:
-- 2020-06-10T10:08:22.933241 daemon:crash.ubuntu [INFO] "Deployed crash.ubuntu on
+- 2020-06-10T10:08:22.933241Z daemon:crash.ubuntu [INFO] "Deployed crash.ubuntu on
   host 'ubuntu'"
 ---
 service_type: crash
@@ -262,12 +268,12 @@ placement:
 status:
   container_image_id: 74803e884bea289d2d2d3ebdf6d37cd560499e955595695b1390a89800f4e37a
   container_image_name: docker.io/ceph/daemon-base:latest-master-devel
-  created: '2020-06-10T10:37:31.051288'
-  last_refresh: '2020-06-10T10:57:40.715637'
+  created: '2020-06-10T10:37:31.051288Z'
+  last_refresh: '2020-06-10T10:57:40.715637Z'
   running: 1
   size: 1
 events:
-- 2020-06-10T10:37:31.139159 service:crash [INFO] "service was created"
+- 2020-06-10T10:37:31.139159Z service:crash [INFO] "service was created"
 """
     types = (DaemonDescription, ServiceDescription)
 
@@ -275,17 +281,73 @@ events:
         data = yaml.safe_load(y)
         object = cls.from_json(data)
 
-        assert to_format(object, 'yaml', False, cls) == y
-        assert to_format([object], 'yaml', True, cls) == y
+        assert to_format(object, Format.yaml, False, cls) == y
+        assert to_format([object], Format.yaml, True, cls) == y
 
-        j = json.loads(to_format(object, 'json', False, cls))
-        assert to_format(cls.from_json(j), 'yaml', False, cls) == y
+        j = json.loads(to_format(object, Format.json, False, cls))
+        assert to_format(cls.from_json(j), Format.yaml, False, cls) == y
 
 
 def test_event_multiline():
     from .._interface import OrchestratorEvent
-    e = OrchestratorEvent(datetime.datetime.utcnow(), 'service', 'subject', 'ERROR', 'message')
+    e = OrchestratorEvent(datetime_now(), 'service', 'subject', 'ERROR', 'message')
     assert OrchestratorEvent.from_json(e.to_json()) == e
 
-    e = OrchestratorEvent(datetime.datetime.utcnow(), 'service', 'subject', 'ERROR', 'multiline\nmessage')
+    e = OrchestratorEvent(datetime_now(), 'service',
+                          'subject', 'ERROR', 'multiline\nmessage')
     assert OrchestratorEvent.from_json(e.to_json()) == e
+
+
+def test_handle_command():
+    cmd = {
+        'prefix': 'orch daemon add',
+        'daemon_type': 'mon',
+        'placement': 'smithi044:[v2:172.21.15.44:3301,v1:172.21.15.44:6790]=c',
+    }
+    m = OrchestratorCli('orchestrator', 0, 0)
+    r = m._handle_command(None, cmd)
+    assert r == HandleCommandResult(
+        retval=-2, stdout='', stderr='No orchestrator configured (try `ceph orch set backend`)')
+
+
+def test_preview_table_osd_smoke():
+    data = [
+        {
+            'service_type': 'osd',
+            'data':
+            {
+                'foo host':
+                [
+                    {
+                        'osdspec': 'foo',
+                        'error': '',
+                        'data':
+                        [
+                            {
+                                "block_db": "/dev/nvme0n1",
+                                "block_db_size": "66.67 GB",
+                                "data": "/dev/sdb",
+                                "data_size": "300.00 GB",
+                                "encryption": "None"
+                            },
+                            {
+                                "block_db": "/dev/nvme0n1",
+                                "block_db_size": "66.67 GB",
+                                "data": "/dev/sdc",
+                                "data_size": "300.00 GB",
+                                "encryption": "None"
+                            },
+                            {
+                                "block_db": "/dev/nvme0n1",
+                                "block_db_size": "66.67 GB",
+                                "data": "/dev/sdd",
+                                "data_size": "300.00 GB",
+                                "encryption": "None"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    ]
+    preview_table_osd(data)

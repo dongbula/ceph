@@ -18,6 +18,7 @@ std::string_view MDSCacheObject::generic_pin_name(int p) const {
     case PIN_TEMPEXPORTING: return "tempexporting";
     case PIN_CLIENTLEASE: return "clientlease";
     case PIN_DISCOVERBASE: return "discoverbase";
+    case PIN_SCRUBQUEUE: return "scrubqueue";
     default: ceph_abort(); return std::string_view();
   }
 }
@@ -37,9 +38,9 @@ void MDSCacheObject::dump(ceph::Formatter *f) const
   {
     f->open_object_section("replicas");
     for (const auto &it : get_replicas()) {
-      std::ostringstream rank_str;
-      rank_str << it.first;
-      f->dump_int(rank_str.str().c_str(), it.second);
+      CachedStackStringStream css;
+      *css << it.first;
+      f->dump_int(css->strv(), it.second);
     }
     f->close_section();
   }
@@ -63,7 +64,7 @@ void MDSCacheObject::dump(ceph::Formatter *f) const
 #ifdef MDS_REF_SET
     f->open_object_section("pins");
     for(const auto& p : ref_map) {
-      f->dump_int(pin_name(p.first).data(), p.second);
+      f->dump_int(pin_name(p.first), p.second);
     }
     f->close_section();
 #endif

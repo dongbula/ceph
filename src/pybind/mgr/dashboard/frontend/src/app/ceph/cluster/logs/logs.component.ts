@@ -3,8 +3,8 @@ import { Component, NgZone, OnDestroy, OnInit } from '@angular/core';
 
 import { NgbDateStruct } from '@ng-bootstrap/ng-bootstrap';
 
-import { LogsService } from '../../../shared/api/logs.service';
-import { Icons } from '../../../shared/enum/icons.enum';
+import { LogsService } from '~/app/shared/api/logs.service';
+import { Icons } from '~/app/shared/enum/icons.enum';
 
 @Component({
   selector: 'cd-logs',
@@ -16,9 +16,12 @@ export class LogsComponent implements OnInit, OnDestroy {
   clog: Array<any>;
   audit_log: Array<any>;
   icons = Icons;
+  clogText: string;
+  auditLogText: string;
 
   interval: number;
-  prioritys: Array<{ name: string; value: string }> = [
+  priorities: Array<{ name: string; value: string }> = [
+    { name: 'Debug', value: '[DBG]' },
     { name: 'Info', value: '[INF]' },
     { name: 'Warning', value: '[WRN]' },
     { name: 'Error', value: '[ERR]' },
@@ -29,6 +32,11 @@ export class LogsComponent implements OnInit, OnDestroy {
   selectedDate: NgbDateStruct;
   startTime = { hour: 0, minute: 0 };
   endTime = { hour: 23, minute: 59 };
+  maxDate = {
+    year: new Date().getFullYear(),
+    month: new Date().getMonth() + 1,
+    day: new Date().getDate()
+  };
 
   constructor(
     private logsService: LogsService,
@@ -54,11 +62,13 @@ export class LogsComponent implements OnInit, OnDestroy {
   getInfo() {
     this.logsService.getLogs().subscribe((data: any) => {
       this.contentData = data;
+      this.clogText = this.logToText(this.contentData.clog);
+      this.auditLogText = this.logToText(this.contentData.audit_log);
       this.filterLogs();
     });
   }
 
-  abstractfilters(): any {
+  abstractFilters(): any {
     const priority = this.priority;
     const key = this.search.toLowerCase().replace(/,/g, '');
 
@@ -107,7 +117,7 @@ export class LogsComponent implements OnInit, OnDestroy {
   }
 
   filterLogs() {
-    const filters = this.abstractfilters();
+    const filters = this.abstractFilters();
     this.clog = this.filterExecutor(this.contentData.clog, filters);
     this.audit_log = this.filterExecutor(this.contentData.audit_log, filters);
   }
@@ -119,5 +129,30 @@ export class LogsComponent implements OnInit, OnDestroy {
   clearDate() {
     this.selectedDate = null;
     this.filterLogs();
+  }
+  resetFilter() {
+    this.priority = 'All';
+    this.search = '';
+    this.selectedDate = null;
+    this.startTime = { hour: 0, minute: 0 };
+    this.endTime = { hour: 23, minute: 59 };
+    this.filterLogs();
+
+    return false;
+  }
+
+  logToText(log: object) {
+    let logText = '';
+    for (const line of Object.keys(log)) {
+      logText =
+        logText +
+        this.datePipe.transform(log[line].stamp, 'medium') +
+        '\t' +
+        log[line].priority +
+        '\t' +
+        log[line].message +
+        '\n';
+    }
+    return logText;
   }
 }
